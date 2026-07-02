@@ -33,6 +33,8 @@ migrate_working_dir/
 /build/
 /coverage/
 /dist/
+/validation/
+**/target/
 
 # Symbolication related
 app.*.symbols

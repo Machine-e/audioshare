@@ -36,5 +36,32 @@ target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
+find_program(CARGO_EXECUTABLE cargo
+  HINTS "$ENV{USERPROFILE}/.cargo/bin")
+if(CARGO_EXECUTABLE)
+  set(AUDIOSHARE_CORE_MANIFEST
+    "${CMAKE_SOURCE_DIR}/../crates/audioshare_core/Cargo.toml")
+  set(AUDIOSHARE_CORE_DLL
+    "${CMAKE_SOURCE_DIR}/../crates/audioshare_core/target/release/audioshare_core.dll")
+  add_custom_command(
+    OUTPUT "${AUDIOSHARE_CORE_DLL}"
+    COMMAND "${CARGO_EXECUTABLE}" build --release --manifest-path "${AUDIOSHARE_CORE_MANIFEST}"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.."
+    COMMENT "Building audioshare_core Rust audio runtime"
+    VERBATIM
+  )
+  add_custom_target(audioshare_core_rust ALL DEPENDS "${AUDIOSHARE_CORE_DLL}")
+  add_dependencies(${BINARY_NAME} audioshare_core_rust)
+  add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${AUDIOSHARE_CORE_DLL}"
+      "$<TARGET_FILE_DIR:${BINARY_NAME}>/audioshare_core.dll"
+  )
+  install(FILES "${AUDIOSHARE_CORE_DLL}" DESTINATION "${CMAKE_INSTALL_PREFIX}"
+    COMPONENT Runtime)
+else()
+  message(WARNING "cargo was not found; audioshare_core.dll will not be built and Windows playback will be unavailable.")
+endif()
+
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)

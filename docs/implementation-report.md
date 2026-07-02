@@ -75,15 +75,18 @@ This report documents the initial implementation completed for the AudioShare pr
 - Windows release packaging completed and produced `dist\AudioShare-Windows-portable.zip`.
 - Android release packaging completed and produced `dist\AudioShare-Android.apk`.
 
+## Current Follow-up Status
+
+- The Android `MediaProjection` plus `AudioPlaybackCapture` path has since been wired to `AudioRecord`, Android `MediaCodec` Opus encoding, and authenticated UDP sending.
+- The Windows runtime has since been wired to the v1 control session, Dart UDP authentication, `audioshare_core.dll`, native jitter buffering, Opus decode, silence insertion, and `cpal` output.
+- Rust validation now runs with Cargo: `cargo fmt --manifest-path crates/audioshare_core/Cargo.toml -- --check` and `cargo test --manifest-path crates/audioshare_core/Cargo.toml` pass.
+- The Windows debug build now copies `audioshare_core.dll` next to `audioshare.exe` when Cargo is available.
+
 ## Known Limitations
 
-- End-to-end real audio streaming is not complete yet.
-- Android `MediaProjection` plus `AudioPlaybackCapture` capture flow still needs full implementation.
-- Flutter-to-Rust integration still needs to be wired through FFI or `flutter_rust_bridge`.
-- Windows playback through `cpal` still needs to be connected to the UI and transport layer.
-- TCP/control-plane behavior and persisted pairing state still need implementation.
-- Rust tests were not run because `cargo` was not installed or was not available on `PATH`.
+- End-to-end real audio streaming still needs hardware proof with Android and Windows devices.
 - Android release APK currently uses the default Flutter debug signing path and needs production signing setup before distribution.
+- Android cannot guarantee local speaker mute/pause for arbitrary third-party playback apps; source-app cooperation or a controlled playback source is required for guaranteed pause/mute semantics.
 
 ## Git State
 

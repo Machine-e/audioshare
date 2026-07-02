@@ -14,12 +14,9 @@ impl OpusCodec {
             2 => opus::Channels::Stereo,
             other => anyhow::bail!("unsupported channel count: {other}"),
         };
-        let mut encoder = opus::Encoder::new(
-            config.sample_rate,
-            channels,
-            opus::Application::Audio,
-        )
-        .context("create opus encoder")?;
+        let mut encoder =
+            opus::Encoder::new(config.sample_rate, channels, opus::Application::Audio)
+                .context("create opus encoder")?;
         encoder
             .set_bitrate(opus::Bitrate::Bits(config.bitrate_kbps as i32 * 1000))
             .context("set opus bitrate")?;
@@ -52,5 +49,23 @@ impl OpusCodec {
             .context("decode opus frame")?;
         output.truncate(len * self.config.channels as usize);
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opus_codec_round_trips_one_pcm_frame() {
+        let config = AudioConfig::default();
+        let mut codec = OpusCodec::new(config.clone()).unwrap();
+        let pcm = vec![0_i16; config.samples_per_frame()];
+
+        let encoded = codec.encode_i16(&pcm).unwrap();
+        let decoded = codec.decode_i16(&encoded).unwrap();
+
+        assert!(!encoded.is_empty());
+        assert_eq!(decoded.len(), config.samples_per_frame());
     }
 }

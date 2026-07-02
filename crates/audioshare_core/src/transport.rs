@@ -16,7 +16,7 @@ impl UdpAudioSender {
     }
 
     pub async fn send(&self, packet: &AudioPacket) -> Result<usize> {
-        let encoded = packet.encode(&self.key);
+        let encoded = packet.encode(&self.key).context("encode audio packet")?;
         self.socket
             .send_to(&encoded, self.peer)
             .await
@@ -37,7 +37,48 @@ impl UdpAudioReceiver {
 
     pub async fn recv(&self) -> Result<AudioPacket> {
         let mut buf = vec![0_u8; 4096];
-        let (len, _) = self.socket.recv_from(&mut buf).await.context("recv audio packet")?;
+        let (len, _) = self
+            .socket
+            .recv_from(&mut buf)
+            .await
+            .context("recv audio packet")?;
         AudioPacket::decode(&self.key, &buf[..len]).context("decode audio packet")
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.socket
+            .local_addr()
+            .context("query UDP receiver address")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn udp_sender_receiver_round_trips_authenticated_packet() {
+        let key = b"secret".to_vec();
+        let receiver = UdpAudioReceiver::bind("127.0.0.1:0".parse().unwrap(), key.clone())
+            .await
+            .unwrap();
+        let sender = UdpAudioSender::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            receiver.local_addr().unwrap(),
+            key,
+        )
+        .await
+        .unwrap();
+        let packet = AudioPacket {
+            session_id: 9,
+            sequence: 3,
+            timestamp_ms: 60,
+            payload: vec![1, 2, 3],
+        };
+
+        sender.send(&packet).await.unwrap();
+        let received = receiver.recv().await.unwrap();
+
+        assert_eq!(received, packet);
     }
 }
