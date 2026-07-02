@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -25,6 +26,14 @@ class MainActivity : FlutterActivity() {
                 "stopForegroundCaptureService" -> {
                     stopService(Intent(this, AudioCaptureService::class.java))
                     AudioCaptureService.clearProjectionData()
+                    result.success(null)
+                }
+                "openBluetoothSettings" -> {
+                    openSettingsIntent(Settings.ACTION_BLUETOOTH_SETTINGS)
+                    result.success(null)
+                }
+                "openCastSettings" -> {
+                    openCastSettings()
                     result.success(null)
                 }
                 else -> result.notImplemented()
@@ -116,6 +125,30 @@ class MainActivity : FlutterActivity() {
             projectionManager.createScreenCaptureIntent(),
             REQUEST_MEDIA_PROJECTION,
         )
+    }
+
+    private fun openCastSettings() {
+        val actions = listOf(
+            "android.settings.CAST_SETTINGS",
+            Settings.ACTION_WIFI_SETTINGS,
+        )
+        for (action in actions) {
+            val intent = Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (intent.resolveActivity(packageManager) != null) {
+                startActivity(intent)
+                return
+            }
+        }
+        openSettingsIntent(Settings.ACTION_SETTINGS)
+    }
+
+    private fun openSettingsIntent(action: String) {
+        val intent = Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (intent.resolveActivity(packageManager) != null) {
+            startActivity(intent)
+        } else {
+            startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
     }
 
     override fun onRequestPermissionsResult(

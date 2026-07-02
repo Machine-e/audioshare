@@ -5,6 +5,7 @@
 #include <flutter/flutter_view_controller.h>
 
 #include <memory>
+#include <functional>
 
 #include "win32_window.h"
 
@@ -28,6 +29,9 @@ class FlutterWindow : public Win32Window {
 
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
+
+  // Keeps native channel cleanup callbacks alive until the engine is destroyed.
+  std::function<void()> external_route_channel_cleanup_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

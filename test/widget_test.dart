@@ -10,6 +10,9 @@ void main() {
     expect(find.text('AudioShare'), findsOneWidget);
     expect(find.text('Android 推流'), findsOneWidget);
     expect(find.text('Windows 接收'), findsOneWidget);
+    expect(find.text('公开捕获'), findsOneWidget);
+    expect(find.text('蓝牙路由'), findsOneWidget);
+    expect(find.text('投屏路由'), findsOneWidget);
     expect(find.text('连接设置'), findsOneWidget);
   });
 
@@ -21,6 +24,36 @@ void main() {
 
     expect(find.text('Windows 音频接收'), findsOneWidget);
     expect(find.text('开始监听'), findsOneWidget);
+  });
+
+  testWidgets('can switch to Windows bluetooth route mode', (tester) async {
+    await tester.pumpWidget(const AudioShareApp());
+
+    await tester.tap(find.text('Windows 接收'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('蓝牙路由'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('蓝牙音频接收'), findsOneWidget);
+    expect(find.text('刷新蓝牙设备'), findsOneWidget);
+    expect(find.text('启动蓝牙接收'), findsOneWidget);
+    expect(find.textContaining('不是 AudioShare UDP 推流'), findsWidgets);
+  });
+
+  test('controller disables Android UDP start for external route modes', () {
+    final controller = AudioShareController();
+
+    controller.setSide(AppSide.android);
+    controller.capturePermissionGranted = true;
+    controller.setSourceMode(AudioSourceMode.bluetoothSink);
+
+    expect(controller.canStartAndroid, isFalse);
+    expect(controller.probeMessage, contains('不走 Tailscale'));
+
+    controller.setSourceMode(AudioSourceMode.wirelessDisplay);
+
+    expect(controller.canStartAndroid, isFalse);
+    expect(controller.lastMessage, contains('无线显示接收端'));
   });
 
   test('controller validates port range', () {

@@ -127,4 +127,14 @@ class AudioCaptureBridge {
     if (!Platform.isAndroid) return;
     await _channel.invokeMethod<void>('stopForegroundCaptureService');
   }
+
+  Future<void> openBluetoothSettings() async {
+    if (!Platform.isAndroid) return;
+    await _channel.invokeMethod<void>('openBluetoothSettings');
+  }
+
+  Future<void> openCastSettings() async {
+    if (!Platform.isAndroid) return;
+    await _channel.invokeMethod<void>('openCastSettings');
+  }
 }

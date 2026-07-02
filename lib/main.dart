@@ -14,6 +14,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'platform/audio_capture_bridge.dart';
+import 'platform/external_route_bridge.dart';
 import 'platform/windows_audio_player.dart';
 import 'protocol/audio_packet.dart';
 
@@ -38,6 +39,16 @@ enum LinkStatus {
 enum LinkProbeStatus { idle, checking, listening, reachable, failed }
 
 enum NetworkProvider { easyTier, tailscale, manual }
+
+enum AudioSourceMode { publicCapture, bluetoothSink, wirelessDisplay }
+
+extension AudioSourceModeLabel on AudioSourceMode {
+  String get label => switch (this) {
+    AudioSourceMode.publicCapture => '公开捕获',
+    AudioSourceMode.bluetoothSink => '蓝牙路由',
+    AudioSourceMode.wirelessDisplay => '投屏路由',
+  };
+}
 
 class AudioConfig {
   const AudioConfig({
@@ -94,6 +105,8 @@ class RuntimeStatus {
     this.udpPacketsSent = false,
     this.udpPacketsReceived = false,
     this.windowsPlaybackActive = false,
+    this.externalRouteActive = false,
+    this.windowsOutputActive = false,
   });
 
   final bool controlConnected;
@@ -103,6 +116,8 @@ class RuntimeStatus {
   final bool udpPacketsSent;
   final bool udpPacketsReceived;
   final bool windowsPlaybackActive;
+  final bool externalRouteActive;
+  final bool windowsOutputActive;
 
   RuntimeStatus copyWith({
     bool? controlConnected,
@@ -112,6 +127,8 @@ class RuntimeStatus {
     bool? udpPacketsSent,
     bool? udpPacketsReceived,
     bool? windowsPlaybackActive,
+    bool? externalRouteActive,
+    bool? windowsOutputActive,
   }) {
     return RuntimeStatus(
       controlConnected: controlConnected ?? this.controlConnected,
@@ -123,6 +140,8 @@ class RuntimeStatus {
       udpPacketsReceived: udpPacketsReceived ?? this.udpPacketsReceived,
       windowsPlaybackActive:
           windowsPlaybackActive ?? this.windowsPlaybackActive,
+      externalRouteActive: externalRouteActive ?? this.externalRouteActive,
+      windowsOutputActive: windowsOutputActive ?? this.windowsOutputActive,
     );
   }
 }
@@ -139,9 +158,11 @@ class AudioShareController extends ChangeNotifier {
     : _captureBridge = captureBridge ?? AudioCaptureBridge();
 
   final AudioCaptureBridge _captureBridge;
+  final ExternalRouteBridge _externalRouteBridge = ExternalRouteBridge();
   final WindowsAudioPlayer _windowsAudioPlayer = WindowsAudioPlayer();
 
   AppSide side = Platform.isWindows ? AppSide.windows : AppSide.android;
+  AudioSourceMode sourceMode = AudioSourceMode.publicCapture;
   LinkStatus status = LinkStatus.idle;
   NetworkProvider networkProvider = NetworkProvider.tailscale;
   AudioConfig audioConfig = const AudioConfig(bitrateKbps: 96, bufferMs: 80);
@@ -164,8 +185,15 @@ class AudioShareController extends ChangeNotifier {
   LinkProbeStatus probeStatus = LinkProbeStatus.idle;
   String probeMessage = '尚未测试连接';
   RuntimeStatus runtimeStatus = const RuntimeStatus();
+  List<ExternalRouteDevice> bluetoothDevices = const [];
+  String? selectedBluetoothDeviceId;
+  ExternalRouteStatus externalRouteStatus = const ExternalRouteStatus(
+    mode: 'idle',
+    message: '尚未启动外部路由',
+  );
 
   Timer? _connectionProbeTimer;
+  Timer? _externalRouteMeterTimer;
   ServerSocket? _windowsProbeServer;
   StreamSubscription<Socket>? _windowsProbeSubscription;
   RawDatagramSocket? _windowsUdpSocket;
@@ -179,14 +207,26 @@ class AudioShareController extends ChangeNotifier {
 
   bool get isWindowsMode => side == AppSide.windows;
   bool get isAndroidMode => side == AppSide.android;
+  bool get isPublicCaptureMode => sourceMode == AudioSourceMode.publicCapture;
+  bool get isExternalRouteMode => sourceMode != AudioSourceMode.publicCapture;
   bool get isActive =>
       status == LinkStatus.pairing ||
       status == LinkStatus.paired ||
       status == LinkStatus.capturing ||
       status == LinkStatus.streaming;
   bool get canStartWindows => isWindowsMode && !isActive;
+  bool get canStartBluetoothSink =>
+      isWindowsMode &&
+      sourceMode == AudioSourceMode.bluetoothSink &&
+      !isActive &&
+      selectedBluetoothDeviceId != null;
+  bool get canStartWirelessDisplay =>
+      isWindowsMode &&
+      sourceMode == AudioSourceMode.wirelessDisplay &&
+      !isActive;
   bool get canStartAndroid =>
       isAndroidMode &&
+      isPublicCaptureMode &&
       capturePermissionGranted &&
       host.trim().isNotEmpty &&
       !isActive;
@@ -213,6 +253,158 @@ class AudioShareController extends ChangeNotifier {
       unawaited(loadOutputDevices());
     }
     notifyListeners();
+  }
+
+  void setSourceMode(AudioSourceMode mode) {
+    if (sourceMode == mode) return;
+    _resetRuntimeStats();
+    _stopAndroidStats();
+    _stopConnectionProbeLoop();
+    _stopExternalRouteMeter();
+    unawaited(_stopWindowsProbeServer());
+    if (sourceMode == AudioSourceMode.bluetoothSink) {
+      unawaited(_externalRouteBridge.stopBluetoothSink());
+    }
+    sourceMode = mode;
+    status = LinkStatus.idle;
+    probeStatus = LinkProbeStatus.idle;
+    probeMessage = switch (mode) {
+      AudioSourceMode.publicCapture => '公开捕获模式需要虚拟网 TCP/UDP 连接测试',
+      AudioSourceMode.bluetoothSink => '蓝牙路由不走 Tailscale，先枚举已配对手机',
+      AudioSourceMode.wirelessDisplay => '投屏路由不走 Tailscale，按系统无线显示流程操作',
+    };
+    lastMessage = switch (mode) {
+      AudioSourceMode.publicCapture => '公开捕获只支持允许 AudioPlaybackCapture 的应用',
+      AudioSourceMode.bluetoothSink => 'Windows 将作为蓝牙音频接收端',
+      AudioSourceMode.wirelessDisplay => 'Windows 将作为无线显示接收端',
+    };
+    if (mode == AudioSourceMode.bluetoothSink && isWindowsMode) {
+      unawaited(refreshBluetoothDevices());
+    }
+    notifyListeners();
+  }
+
+  Future<void> refreshBluetoothDevices() async {
+    externalRouteStatus = const ExternalRouteStatus(
+      mode: 'checking',
+      message: '正在枚举支持远端音频播放连接的已配对蓝牙设备',
+    );
+    notifyListeners();
+    try {
+      bluetoothDevices = await _externalRouteBridge.listBluetoothDevices();
+      selectedBluetoothDeviceId ??= bluetoothDevices.isEmpty
+          ? null
+          : bluetoothDevices.first.id;
+      externalRouteStatus = ExternalRouteStatus(
+        mode: bluetoothDevices.isEmpty ? 'not_found' : 'ready',
+        message: bluetoothDevices.isEmpty
+            ? '未发现支持 AudioPlaybackConnection 的已配对手机，请先在系统蓝牙设置中配对'
+            : '已发现 ${bluetoothDevices.length} 个可尝试连接的蓝牙音频设备',
+      );
+    } on PlatformException catch (error) {
+      externalRouteStatus = ExternalRouteStatus(
+        mode: 'error',
+        message: error.message ?? '蓝牙设备枚举失败',
+      );
+    } catch (error) {
+      externalRouteStatus = ExternalRouteStatus(
+        mode: 'error',
+        message: '蓝牙设备枚举失败：$error',
+      );
+    }
+    notifyListeners();
+  }
+
+  void selectBluetoothDevice(String value) {
+    selectedBluetoothDeviceId = value;
+    notifyListeners();
+  }
+
+  Future<void> startBluetoothSink() async {
+    final deviceId = selectedBluetoothDeviceId;
+    if (deviceId == null) {
+      status = LinkStatus.error;
+      lastMessage = '请先选择已配对的 Android 手机';
+      notifyListeners();
+      return;
+    }
+    status = LinkStatus.pairing;
+    externalRouteStatus = const ExternalRouteStatus(
+      mode: 'starting',
+      message: '正在启用 Windows 蓝牙音频接收端',
+    );
+    notifyListeners();
+    try {
+      externalRouteStatus = await _externalRouteBridge.startBluetoothSink(
+        deviceId,
+      );
+      final ok =
+          externalRouteStatus.mode == 'enabled' ||
+          externalRouteStatus.mode == 'playing';
+      status = ok ? LinkStatus.streaming : LinkStatus.error;
+      runtimeStatus = runtimeStatus.copyWith(
+        externalRouteActive: ok,
+        windowsPlaybackActive: ok,
+      );
+      lastMessage = ok
+          ? 'Windows 正在作为蓝牙音频接收端，请在 Android 媒体输出中选择这台 PC'
+          : externalRouteStatus.message;
+      if (ok) _startExternalRouteMeter();
+    } on PlatformException catch (error) {
+      status = LinkStatus.error;
+      externalRouteStatus = ExternalRouteStatus(
+        mode: 'error',
+        message: error.message ?? '蓝牙音频接收启动失败',
+      );
+      lastMessage = externalRouteStatus.message;
+    } catch (error) {
+      status = LinkStatus.error;
+      externalRouteStatus = ExternalRouteStatus(
+        mode: 'error',
+        message: '蓝牙音频接收启动失败：$error',
+      );
+      lastMessage = externalRouteStatus.message;
+    }
+    notifyListeners();
+  }
+
+  Future<void> openWirelessDisplay() async {
+    status = LinkStatus.pairing;
+    externalRouteStatus = const ExternalRouteStatus(
+      mode: 'starting',
+      message: '正在打开 Windows 无线显示接收入口',
+    );
+    notifyListeners();
+    try {
+      externalRouteStatus = await _externalRouteBridge.openWirelessDisplay();
+      status = LinkStatus.paired;
+      runtimeStatus = runtimeStatus.copyWith(externalRouteActive: true);
+      lastMessage = '请在 Android 投屏/无线显示/Smart View 中选择这台 Windows PC';
+      _startExternalRouteMeter();
+    } on PlatformException catch (error) {
+      status = LinkStatus.error;
+      externalRouteStatus = ExternalRouteStatus(
+        mode: 'error',
+        message: error.message ?? '无线显示入口打开失败',
+      );
+      lastMessage = externalRouteStatus.message;
+    } catch (error) {
+      status = LinkStatus.error;
+      externalRouteStatus = ExternalRouteStatus(
+        mode: 'error',
+        message: '无线显示入口打开失败：$error',
+      );
+      lastMessage = externalRouteStatus.message;
+    }
+    notifyListeners();
+  }
+
+  Future<void> openAndroidBluetoothSettings() async {
+    await _captureBridge.openBluetoothSettings();
+  }
+
+  Future<void> openAndroidCastSettings() async {
+    await _captureBridge.openCastSettings();
   }
 
   void updateHost(String value) {
@@ -384,6 +576,8 @@ class AudioShareController extends ChangeNotifier {
     unawaited(_sendStopStream());
     unawaited(_stopWindowsProbeServer());
     unawaited(_captureBridge.stopForegroundService());
+    unawaited(_externalRouteBridge.stopBluetoothSink());
+    _stopExternalRouteMeter();
     _windowsAudioPlayer.stop();
     status = LinkStatus.stopped;
     probeStatus = LinkProbeStatus.idle;
@@ -393,6 +587,10 @@ class AudioShareController extends ChangeNotifier {
     _lastWindowsSequence = -1;
     _missedHeartbeats = 0;
     lastMessage = '已停止';
+    externalRouteStatus = const ExternalRouteStatus(
+      mode: 'stopped',
+      message: '外部路由已停止',
+    );
     notifyListeners();
   }
 
@@ -860,6 +1058,33 @@ class AudioShareController extends ChangeNotifier {
     runtimeStatus = const RuntimeStatus();
   }
 
+  void _startExternalRouteMeter() {
+    _stopExternalRouteMeter();
+    _externalRouteMeterTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      unawaited(_refreshExternalRouteMeter());
+    });
+    unawaited(_refreshExternalRouteMeter());
+  }
+
+  Future<void> _refreshExternalRouteMeter() async {
+    final active = await _externalRouteBridge.isWindowsOutputActive();
+    runtimeStatus = runtimeStatus.copyWith(
+      externalRouteActive: true,
+      windowsOutputActive: active,
+      windowsPlaybackActive: active || runtimeStatus.windowsPlaybackActive,
+    );
+    if (active && isExternalRouteMode) {
+      status = LinkStatus.streaming;
+      lastMessage = '手机音频已路由到 Windows，检测到本机输出活动';
+    }
+    notifyListeners();
+  }
+
+  void _stopExternalRouteMeter() {
+    _externalRouteMeterTimer?.cancel();
+    _externalRouteMeterTimer = null;
+  }
+
   String _deriveAudioAuthKey(String code, int sessionId) {
     final normalized = _normalizePairingCode(code);
     return 'audioshare-v1:$normalized:$sessionId';
@@ -884,7 +1109,9 @@ class AudioShareController extends ChangeNotifier {
     _resetRuntimeStats();
     _stopAndroidStats();
     _stopConnectionProbeLoop();
+    _stopExternalRouteMeter();
     unawaited(_stopWindowsProbeServer());
+    unawaited(_externalRouteBridge.stopBluetoothSink());
     _windowsAudioPlayer.stop();
     super.dispose();
   }
@@ -1040,6 +1267,31 @@ class _PrimaryPanel extends StatelessWidget {
 
   final AudioShareController controller;
 
+  String get _title {
+    if (controller.sourceMode == AudioSourceMode.bluetoothSink) {
+      return controller.isWindowsMode ? '蓝牙音频接收' : '蓝牙系统路由';
+    }
+    if (controller.sourceMode == AudioSourceMode.wirelessDisplay) {
+      return controller.isWindowsMode ? '无线显示接收' : '投屏系统路由';
+    }
+    return controller.isAndroidMode ? '系统音频推流' : 'Windows 音频接收';
+  }
+
+  String get _description => switch (controller.sourceMode) {
+    AudioSourceMode.publicCapture =>
+      controller.isAndroidMode
+          ? '采集 Android 12+ 允许捕获的媒体播放音频，通过虚拟网 UDP 发送到 Windows。'
+          : '在虚拟网 IP 上监听 Android 公开捕获推流，解码后播放到选定输出设备。',
+    AudioSourceMode.bluetoothSink =>
+      controller.isAndroidMode
+          ? '打开系统蓝牙设置，将媒体输出路由到 Windows PC；这不是 AudioShare UDP 推流。'
+          : 'Windows 通过 AudioPlaybackConnection 作为蓝牙音频接收端，不使用 Tailscale/UDP。',
+    AudioSourceMode.wirelessDisplay =>
+      controller.isAndroidMode
+          ? '打开投屏/无线显示/Smart View，让音频随系统投屏进入 Windows；这不是 UDP 推流。'
+          : '打开 Windows 无线显示接收入口，等待 Android Cast/投屏连接，音频由系统投屏通道承载。',
+  };
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -1062,22 +1314,44 @@ class _PrimaryPanel extends StatelessWidget {
           selected: {controller.side},
           onSelectionChanged: (value) => controller.setSide(value.first),
         ),
+        const SizedBox(height: 12),
+        SegmentedButton<AudioSourceMode>(
+          segments: const [
+            ButtonSegment(
+              value: AudioSourceMode.publicCapture,
+              icon: Icon(Icons.settings_voice_outlined),
+              label: Text('公开捕获'),
+            ),
+            ButtonSegment(
+              value: AudioSourceMode.bluetoothSink,
+              icon: Icon(Icons.bluetooth_audio),
+              label: Text('蓝牙路由'),
+            ),
+            ButtonSegment(
+              value: AudioSourceMode.wirelessDisplay,
+              icon: Icon(Icons.cast_connected),
+              label: Text('投屏路由'),
+            ),
+          ],
+          selected: {controller.sourceMode},
+          onSelectionChanged: controller.isActive
+              ? null
+              : (value) => controller.setSourceMode(value.first),
+        ),
         const SizedBox(height: 16),
         _PanelCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                controller.isAndroidMode ? '系统音频推流' : 'Windows 音频接收',
+                _title,
                 style: theme.textTheme.headlineSmall?.copyWith(
                   fontWeight: FontWeight.w700,
                 ),
               ),
               const SizedBox(height: 8),
               Text(
-                controller.isAndroidMode
-                    ? '采集 Android 12+ 允许捕获的媒体播放音频，通过虚拟网发送到 Windows。'
-                    : '在虚拟网 IP 上监听 Android 推流，解码后播放到选定输出设备。',
+                _description,
                 style: theme.textTheme.bodyMedium?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
@@ -1088,19 +1362,24 @@ class _PrimaryPanel extends StatelessWidget {
               else
                 _WindowsActions(controller: controller),
               const SizedBox(height: 16),
-              _ConnectionStatusCard(
-                status: controller.probeStatus,
-                message: controller.probeMessage,
-                isWindowsMode: controller.isWindowsMode,
-              ),
+              if (controller.isPublicCaptureMode)
+                _ConnectionStatusCard(
+                  status: controller.probeStatus,
+                  message: controller.probeMessage,
+                  isWindowsMode: controller.isWindowsMode,
+                )
+              else
+                _ExternalRouteStatusCard(controller: controller),
               const SizedBox(height: 16),
               _RuntimeStatusCard(
+                sourceMode: controller.sourceMode,
                 status: controller.runtimeStatus,
                 stats: controller.stats,
               ),
-              if (controller.isAndroidMode) ...[
+              if (controller.isAndroidMode ||
+                  controller.isExternalRouteMode) ...[
                 const SizedBox(height: 16),
-                const _CompatibilityCard(),
+                _CompatibilityCard(sourceMode: controller.sourceMode),
               ],
               const SizedBox(height: 16),
               _MessageStrip(message: controller.lastMessage),
@@ -1108,7 +1387,10 @@ class _PrimaryPanel extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 16),
-        _StatsGrid(stats: controller.stats),
+        if (controller.isPublicCaptureMode)
+          _StatsGrid(stats: controller.stats)
+        else
+          _ExternalRouteChecklist(controller: controller),
       ],
     );
   }
@@ -1121,6 +1403,42 @@ class _AndroidActions extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (controller.sourceMode == AudioSourceMode.bluetoothSink) {
+      return Wrap(
+        spacing: 12,
+        runSpacing: 12,
+        children: [
+          FilledButton.icon(
+            onPressed: controller.openAndroidBluetoothSettings,
+            icon: const Icon(Icons.bluetooth),
+            label: const Text('打开蓝牙设置'),
+          ),
+          OutlinedButton.icon(
+            onPressed: controller.openAndroidCastSettings,
+            icon: const Icon(Icons.cast),
+            label: const Text('改用投屏设置'),
+          ),
+        ],
+      );
+    }
+    if (controller.sourceMode == AudioSourceMode.wirelessDisplay) {
+      return Wrap(
+        spacing: 12,
+        runSpacing: 12,
+        children: [
+          FilledButton.icon(
+            onPressed: controller.openAndroidCastSettings,
+            icon: const Icon(Icons.cast_connected),
+            label: const Text('打开投屏设置'),
+          ),
+          OutlinedButton.icon(
+            onPressed: controller.openAndroidBluetoothSettings,
+            icon: const Icon(Icons.bluetooth),
+            label: const Text('改用蓝牙设置'),
+          ),
+        ],
+      );
+    }
     return Wrap(
       spacing: 12,
       runSpacing: 12,
@@ -1163,6 +1481,75 @@ class _WindowsActions extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (controller.sourceMode == AudioSourceMode.bluetoothSink) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: controller.isActive
+                    ? null
+                    : controller.refreshBluetoothDevices,
+                icon: const Icon(Icons.refresh),
+                label: const Text('刷新蓝牙设备'),
+              ),
+              FilledButton.icon(
+                onPressed: controller.canStartBluetoothSink
+                    ? controller.startBluetoothSink
+                    : null,
+                icon: const Icon(Icons.bluetooth_audio),
+                label: const Text('启动蓝牙接收'),
+              ),
+              OutlinedButton.icon(
+                onPressed: controller.canStop ? controller.stop : null,
+                icon: const Icon(Icons.stop),
+                label: const Text('停止'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          DropdownMenu<String>(
+            label: const Text('已配对 Android 手机'),
+            initialSelection: controller.selectedBluetoothDeviceId,
+            onSelected: (value) {
+              if (value != null) controller.selectBluetoothDevice(value);
+            },
+            dropdownMenuEntries: [
+              for (final device in controller.bluetoothDevices)
+                DropdownMenuEntry(
+                  value: device.id,
+                  label: device.isConnected
+                      ? '${device.name}（已连接）'
+                      : device.name,
+                ),
+            ],
+          ),
+        ],
+      );
+    }
+    if (controller.sourceMode == AudioSourceMode.wirelessDisplay) {
+      return Wrap(
+        spacing: 12,
+        runSpacing: 12,
+        children: [
+          FilledButton.icon(
+            onPressed: controller.canStartWirelessDisplay
+                ? controller.openWirelessDisplay
+                : null,
+            icon: const Icon(Icons.cast_connected),
+            label: const Text('打开无线显示接收'),
+          ),
+          OutlinedButton.icon(
+            onPressed: controller.canStop ? controller.stop : null,
+            icon: const Icon(Icons.stop),
+            label: const Text('停止'),
+          ),
+        ],
+      );
+    }
     return Wrap(
       spacing: 12,
       runSpacing: 12,
@@ -1197,71 +1584,89 @@ class _SettingsPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isPublicCapture = controller.isPublicCaptureMode;
     return _PanelCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text('连接设置', style: Theme.of(context).textTheme.titleLarge),
+          Text(
+            isPublicCapture ? '连接设置' : '外部路由设置',
+            style: Theme.of(context).textTheme.titleLarge,
+          ),
           const SizedBox(height: 16),
-          DropdownMenu<NetworkProvider>(
-            label: const Text('外部组网'),
-            initialSelection: controller.networkProvider,
-            onSelected: (value) {
-              if (value != null) controller.setNetworkProvider(value);
-            },
-            dropdownMenuEntries: const [
-              DropdownMenuEntry(
-                value: NetworkProvider.tailscale,
-                label: 'Tailscale',
-              ),
-              DropdownMenuEntry(
-                value: NetworkProvider.easyTier,
-                label: 'EasyTier',
-              ),
-              DropdownMenuEntry(value: NetworkProvider.manual, label: '手动虚拟网'),
-            ],
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: hostController,
-            decoration: const InputDecoration(
-              labelText: 'Windows 虚拟网 IP',
-              prefixIcon: Icon(Icons.dns_outlined),
+          if (isPublicCapture) ...[
+            DropdownMenu<NetworkProvider>(
+              label: const Text('外部组网'),
+              initialSelection: controller.networkProvider,
+              onSelected: (value) {
+                if (value != null) controller.setNetworkProvider(value);
+              },
+              dropdownMenuEntries: const [
+                DropdownMenuEntry(
+                  value: NetworkProvider.tailscale,
+                  label: 'Tailscale',
+                ),
+                DropdownMenuEntry(
+                  value: NetworkProvider.easyTier,
+                  label: 'EasyTier',
+                ),
+                DropdownMenuEntry(
+                  value: NetworkProvider.manual,
+                  label: '手动虚拟网',
+                ),
+              ],
             ),
-            onChanged: controller.updateHost,
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: portController,
-            decoration: const InputDecoration(
-              labelText: '监听端口',
-              prefixIcon: Icon(Icons.tag),
+            const SizedBox(height: 12),
+            TextField(
+              controller: hostController,
+              decoration: const InputDecoration(
+                labelText: 'Windows 虚拟网 IP',
+                prefixIcon: Icon(Icons.dns_outlined),
+              ),
+              onChanged: controller.updateHost,
             ),
-            keyboardType: TextInputType.number,
-            onChanged: controller.updatePort,
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            readOnly: controller.isWindowsMode,
-            decoration: InputDecoration(
-              labelText: '配对码',
-              prefixIcon: const Icon(Icons.password),
-              suffixIcon: controller.isWindowsMode
-                  ? IconButton(
-                      tooltip: '刷新配对码',
-                      icon: const Icon(Icons.refresh),
-                      onPressed: controller.refreshPairingCode,
-                    )
+            const SizedBox(height: 12),
+            TextField(
+              controller: portController,
+              decoration: const InputDecoration(
+                labelText: '监听端口',
+                prefixIcon: Icon(Icons.tag),
+              ),
+              keyboardType: TextInputType.number,
+              onChanged: controller.updatePort,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              readOnly: controller.isWindowsMode,
+              decoration: InputDecoration(
+                labelText: '配对码',
+                prefixIcon: const Icon(Icons.password),
+                suffixIcon: controller.isWindowsMode
+                    ? IconButton(
+                        tooltip: '刷新配对码',
+                        icon: const Icon(Icons.refresh),
+                        onPressed: controller.refreshPairingCode,
+                      )
+                    : null,
+              ),
+              controller: TextEditingController(text: controller.pairingCode),
+              onChanged: controller.isAndroidMode
+                  ? controller.updatePairingCode
                   : null,
             ),
-            controller: TextEditingController(text: controller.pairingCode),
-            onChanged: controller.isAndroidMode
-                ? controller.updatePairingCode
-                : null,
-          ),
-          const SizedBox(height: 12),
+            const SizedBox(height: 12),
+          ] else ...[
+            _RouteInstruction(
+              icon: controller.sourceMode == AudioSourceMode.bluetoothSink
+                  ? Icons.bluetooth_audio
+                  : Icons.cast_connected,
+              text: controller.sourceMode == AudioSourceMode.bluetoothSink
+                  ? '蓝牙路由由 Windows 和 Android 系统蓝牙栈承载，不使用虚拟网、配对码、UDP 或 Opus 设置。'
+                  : '投屏路由由 Wireless Display/Cast 承载，不使用虚拟网、配对码、UDP 或 Opus 设置。',
+            ),
+          ],
           DropdownMenu<String>(
-            label: const Text('Windows 输出设备'),
+            label: Text(isPublicCapture ? 'Windows 输出设备' : 'Windows 系统输出设备'),
             initialSelection: controller.outputDevice,
             onSelected: (value) {
               if (value != null) controller.setOutputDevice(value);
@@ -1274,33 +1679,64 @@ class _SettingsPanel extends StatelessWidget {
                 ),
             ],
           ),
-          const SizedBox(height: 20),
-          _SliderSetting(
-            label: 'Opus 码率',
-            value: controller.audioConfig.bitrateKbps.toDouble(),
-            min: 48,
-            max: 192,
-            divisions: 6,
-            suffix: '${controller.audioConfig.bitrateKbps} kbps',
-            onChanged: controller.updateBitrate,
-          ),
-          _SliderSetting(
-            label: '缓冲',
-            value: controller.audioConfig.bufferMs.toDouble(),
-            min: 40,
-            max: 180,
-            divisions: 7,
-            suffix: '${controller.audioConfig.bufferMs} ms',
-            onChanged: controller.updateBuffer,
-          ),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Android 前台服务'),
-            subtitle: const Text('后台和息屏时保持推流'),
-            value: controller.foregroundServiceEnabled,
-            onChanged: null,
-          ),
+          if (isPublicCapture) ...[
+            const SizedBox(height: 20),
+            _SliderSetting(
+              label: 'Opus 码率',
+              value: controller.audioConfig.bitrateKbps.toDouble(),
+              min: 48,
+              max: 192,
+              divisions: 6,
+              suffix: '${controller.audioConfig.bitrateKbps} kbps',
+              onChanged: controller.updateBitrate,
+            ),
+            _SliderSetting(
+              label: '缓冲',
+              value: controller.audioConfig.bufferMs.toDouble(),
+              min: 40,
+              max: 180,
+              divisions: 7,
+              suffix: '${controller.audioConfig.bufferMs} ms',
+              onChanged: controller.updateBuffer,
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Android 前台服务'),
+              subtitle: const Text('后台和息屏时保持推流'),
+              value: controller.foregroundServiceEnabled,
+              onChanged: null,
+            ),
+          ],
         ],
+      ),
+    );
+  }
+}
+
+class _RouteInstruction extends StatelessWidget {
+  const _RouteInstruction({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: scheme.onSurfaceVariant),
+            const SizedBox(width: 10),
+            Expanded(child: Text(text)),
+          ],
+        ),
       ),
     );
   }
@@ -1342,9 +1778,74 @@ class _StatsGrid extends StatelessWidget {
   }
 }
 
-class _RuntimeStatusCard extends StatelessWidget {
-  const _RuntimeStatusCard({required this.status, required this.stats});
+class _ExternalRouteChecklist extends StatelessWidget {
+  const _ExternalRouteChecklist({required this.controller});
 
+  final AudioShareController controller;
+
+  List<String> get _steps {
+    if (controller.sourceMode == AudioSourceMode.bluetoothSink) {
+      return controller.isWindowsMode
+          ? const [
+              '在 Windows 蓝牙设置中先配对 Android 手机。',
+              '刷新蓝牙设备，选择手机并启动蓝牙接收。',
+              '在 Android 媒体输出中选择这台 Windows PC。',
+            ]
+          : const [
+              '先与 Windows PC 完成系统蓝牙配对。',
+              '播放媒体后打开 Android 媒体输出选择器。',
+              '选择 Windows PC；AudioShare 不启动 UDP 推流。',
+            ];
+    }
+    return controller.isWindowsMode
+        ? const [
+            '安装并打开 Windows Wireless Display / 投影到此电脑入口。',
+            '让 Windows 处于可被发现的无线显示接收状态。',
+            '在 Android 投屏、无线显示、屏幕镜像、Smart View 或 Cast 中选择这台 PC。',
+          ]
+        : const [
+            '打开 Android 投屏、无线显示、屏幕镜像、Smart View 或 Cast。',
+            '选择 Windows PC，并确认音频随投屏输出。',
+            '如果设备只支持 Chromecast，可能无法连接 Windows Wireless Display。',
+          ];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return _PanelCard(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text('系统路由 checklist', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 10),
+          for (final step in _steps)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(Icons.checklist, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(child: Text(step)),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RuntimeStatusCard extends StatelessWidget {
+  const _RuntimeStatusCard({
+    required this.sourceMode,
+    required this.status,
+    required this.stats,
+  });
+
+  final AudioSourceMode sourceMode;
   final RuntimeStatus status;
   final StreamStats stats;
 
@@ -1357,22 +1858,36 @@ class _RuntimeStatusCard extends StatelessWidget {
         children: [
           Text('运行状态', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 10),
-          _StatusRow(label: 'TCP 控制已连接', enabled: status.controlConnected),
-          _StatusRow(
-            label: 'MediaProjection 已授权',
-            enabled: status.mediaProjectionAuthorized,
-          ),
-          _StatusRow(
-            label: 'AudioRecord 正在捕获',
-            enabled: status.audioRecordCapturing,
-          ),
-          _StatusRow(label: 'Opus 正在编码', enabled: status.opusEncoding),
-          _StatusRow(label: 'UDP 已发送', enabled: status.udpPacketsSent),
-          _StatusRow(label: 'UDP 已接收', enabled: status.udpPacketsReceived),
-          _StatusRow(
-            label: 'Windows 播放活跃',
-            enabled: status.windowsPlaybackActive,
-          ),
+          if (sourceMode == AudioSourceMode.publicCapture) ...[
+            _StatusRow(label: 'TCP 控制已连接', enabled: status.controlConnected),
+            _StatusRow(
+              label: 'MediaProjection 已授权',
+              enabled: status.mediaProjectionAuthorized,
+            ),
+            _StatusRow(
+              label: 'AudioRecord 正在捕获',
+              enabled: status.audioRecordCapturing,
+            ),
+            _StatusRow(label: 'Opus 正在编码', enabled: status.opusEncoding),
+            _StatusRow(label: 'UDP 已发送', enabled: status.udpPacketsSent),
+            _StatusRow(label: 'UDP 已接收', enabled: status.udpPacketsReceived),
+            _StatusRow(
+              label: 'Windows 播放活跃',
+              enabled: status.windowsPlaybackActive,
+            ),
+          ] else ...[
+            _StatusRow(label: '外部路由已启用', enabled: status.externalRouteActive),
+            _StatusRow(
+              label: 'Windows 输出活动',
+              enabled: status.windowsOutputActive,
+            ),
+            _StatusRow(
+              label: sourceMode == AudioSourceMode.bluetoothSink
+                  ? '蓝牙接收通道'
+                  : '无线显示通道',
+              enabled: status.externalRouteActive,
+            ),
+          ],
           if (stats.zeroFrames > 0 ||
               stats.readErrors > 0 ||
               stats.sendErrors > 0)
@@ -1418,7 +1933,18 @@ class _StatusRow extends StatelessWidget {
 }
 
 class _CompatibilityCard extends StatelessWidget {
-  const _CompatibilityCard();
+  const _CompatibilityCard({required this.sourceMode});
+
+  final AudioSourceMode sourceMode;
+
+  String get _message => switch (sourceMode) {
+    AudioSourceMode.publicCapture =>
+      '公开捕获只覆盖允许 AudioPlaybackCapture 的应用。如果出现静音帧或 0 PCM，说明源应用可能禁止捕获；可切换到蓝牙路由或投屏路由。第三方应用是否继续本机外放，取决于源应用、设备路由和系统音频焦点策略。',
+    AudioSourceMode.bluetoothSink =>
+      '蓝牙路由是系统媒体输出路径，不是 AudioShare UDP 推流。请先在 Windows 配对 Android，再在 Android 媒体输出中选择这台 PC。',
+    AudioSourceMode.wirelessDisplay =>
+      '投屏路由是系统 Cast/Wireless Display 路径，不是 AudioShare UDP 推流。Android 厂商入口可能显示为投屏、无线显示、屏幕镜像、Smart View 或 Cast。',
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -1439,10 +1965,87 @@ class _CompatibilityCard extends StatelessWidget {
               color: scheme.onSecondaryContainer,
             ),
             const SizedBox(width: 10),
-            const Expanded(
-              child: Text(
-                'AudioShare 只能捕获允许系统播放捕获的应用；第三方应用是否继续本机外放，取决于源应用、设备路由和系统音频焦点策略。',
+            Expanded(child: Text(_message)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ExternalRouteStatusCard extends StatelessWidget {
+  const _ExternalRouteStatusCard({required this.controller});
+
+  final AudioShareController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final status = controller.externalRouteStatus;
+    final isError = status.mode == 'error';
+    final active = controller.runtimeStatus.externalRouteActive;
+    final color = isError
+        ? Colors.red
+        : active
+        ? Colors.green
+        : Colors.blue;
+    final title = controller.sourceMode == AudioSourceMode.bluetoothSink
+        ? '蓝牙外部路由状态'
+        : '无线显示外部路由状态';
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  active ? Icons.check_circle : Icons.info_outline,
+                  size: 20,
+                  color: color,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    title,
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                Text(
+                  status.mode,
+                  style: theme.textTheme.labelLarge?.copyWith(color: color),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              status.message,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
               ),
+            ),
+            const SizedBox(height: 10),
+            LinearProgressIndicator(
+              value: controller.runtimeStatus.windowsOutputActive ? 1 : 0,
+              minHeight: 6,
+              color: color,
+              backgroundColor: color.withValues(alpha: 0.15),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              controller.runtimeStatus.windowsOutputActive
+                  ? 'Windows 默认输出设备检测到音频活动'
+                  : '等待 Windows 默认输出设备出现音频活动',
+              style: theme.textTheme.bodySmall,
             ),
           ],
         ),
