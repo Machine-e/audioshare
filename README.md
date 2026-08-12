@@ -1,94 +1,58 @@
 # AudioShare
 
-AudioShare streams Android system playback audio to Windows over a virtual
-network. It is designed for devices connected through Tailscale, EasyTier, or
-another user-managed mesh/VPN, so both sides only need to reach each other by
-IP and port.
+AudioShare is a Bluetooth-only way to play Android media through a Windows PC.
+Windows acts as a classic Bluetooth A2DP Sink. Android, including HyperOS,
+uses normal system pairing and its media-output selector; the Android app only
+opens Bluetooth settings.
 
-## First Release Scope
+AudioShare does **not** use Tailscale, EasyTier, TCP/UDP streaming, Opus,
+Auracast, screen casting, MediaProjection, or Android audio capture.
 
-- Android 12+ captures allowed system playback audio.
-- Android runs capture/streaming through a foreground service model.
-- Windows listens for a paired Android sender.
-- Audio uses Opus over UDP with a TCP control channel.
-- Windows plays received audio to a selected output device.
-- Pairing uses a one-time code, then authenticated audio packets.
-- Release artifacts are a Windows portable zip and Android APK.
+## Requirements
 
-## Repository Shape
+- Windows 11 with a Bluetooth adapter/driver that supports A2DP Sink through
+  `AudioPlaybackConnection`.
+- An Android phone with classic Bluetooth media output.
+- Both devices paired in their system Bluetooth settings.
 
-- `lib/` - Flutter UI and app state.
-- `crates/audioshare_core/` - Rust protocol, codec, transport, and audio primitives.
-- `android/app/src/main/kotlin/com/machinee/audioshare/` - Android platform glue for foreground capture service startup.
-- `docs/protocol.md` - v1 protocol notes.
-- `scripts/` - local release packaging helpers.
+## Build
 
-## Development
-
-Flutter is installed locally at `E:\Programs\flutter` in the current workspace:
+Use the local Flutter SDK when Flutter is not on `PATH`:
 
 ```powershell
 E:\Programs\flutter\bin\flutter.bat pub get
 E:\Programs\flutter\bin\flutter.bat test
 E:\Programs\flutter\bin\flutter.bat analyze
+E:\Programs\flutter\bin\flutter.bat build windows --release
+E:\Programs\flutter\bin\flutter.bat build apk --release
 ```
 
-Rust is required before native-core checks can run:
-
-```powershell
-cargo test --manifest-path crates/audioshare_core/Cargo.toml
-```
-
-For the full automated validation gate used by the Android audio routing work:
-
-```powershell
-.\scripts\validate_android_audio_routing.ps1
-```
-
-Hardware validation for the routing fix is tracked in
-`docs/android-audio-routing-validation-checklist.md`.
-Run `.\scripts\check_android_audio_routing_prereqs.ps1` first to confirm that
-ADB, Flutter device detection, and the virtual-network IP are ready.
-Use `.\scripts\collect_android_audio_routing_evidence.ps1` during device
-testing to create a timestamped local evidence report under `validation/`.
-
-The Android build uses Gradle 8.14.3, Android Gradle Plugin 8.11.1, and Kotlin
-2.2.20. Maven repositories include `storage.flutter-io.cn` and Aliyun mirrors
-first for this workspace.
-
-## Release Builds
+Portable artifacts can be packaged with:
 
 ```powershell
 .\scripts\build_windows_portable.ps1
 .\scripts\build_android_apk.ps1
 ```
 
-## Network Setup
+## Use
 
-1. Install and connect Tailscale or EasyTier on both devices.
-2. Confirm Windows and Android can reach each other over the virtual network.
-3. Start Windows receiver and note the virtual-network IP, port, and pairing code.
-4. Start Android sender, grant system playback capture, and enter the Windows details.
+1. Pair the Android phone and Windows PC using system Bluetooth settings.
+2. Start AudioShare on Windows, select the paired phone, and enable Bluetooth
+   audio reception.
+3. On Android/HyperOS, choose the Windows PC in the system media-output picker.
+4. Play media and keep AudioShare running while Windows receives audio.
+5. Stop reception in AudioShare before removing the pairing.
 
-Audio capture depends on Android's playback-capture rules. Apps that block
-capture, DRM media, calls, and protected content are outside the v1 support
-target.
+See [the Bluetooth success and troubleshooting guide](docs/blue-tooth-success/README.md)
+for the proven setup and recovery steps.
 
-## Current Runtime Notes
+## Limitations
 
-- `测试连接` is a TCP reachability diagnostic only; stream state requires a v1
-  `Hello` / `Pair` / `PairAccepted` / `StartStream` session.
-- Android capture now creates `AudioPlaybackCaptureConfiguration`, reads PCM16
-  frames with `AudioRecord`, encodes Opus through Android `MediaCodec`, and sends
-  authenticated UDP packets.
-- The Flutter UI shows separate control, capture, Opus, UDP send/receive, and
-  playback status rows backed by runtime counters rather than simulated timers.
-- Android requests audio focus while streaming as best-effort local playback
-  control, but third-party apps may continue playback if they ignore focus or
-  disallow capture.
-- Android stops capture and UDP sending after repeated Windows heartbeat
-  failures.
-- Windows authenticates UDP packets in Dart, then hands Opus payloads to
-  `audioshare_core.dll` for jitter buffering, Opus decode, silence insertion,
-  and `cpal` output. The Windows build needs `cargo` on PATH so CMake can build
-  and copy that DLL next to `audioshare.exe`.
+- Compatibility depends on the Windows Bluetooth adapter, driver, Windows
+  version, and phone firmware.
+- A paired device is not necessarily an active media route; Android must select
+  the PC as its media output.
+- Bluetooth latency and quality are controlled by the system Bluetooth stacks.
+- Calls, alarms, protected media, and non-media audio may route differently.
+- AudioShare does not receive Auracast/LE Audio broadcasts and cannot stream
+  audio over an IP network.

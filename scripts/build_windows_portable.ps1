@@ -5,6 +5,13 @@ if (-not (Test-Path $flutter)) {
     $flutter = "flutter"
 }
 
+@(
+    (Join-Path $PSScriptRoot "..\build\windows"),
+    (Join-Path $PSScriptRoot "..\build\flutter_assets")
+) | Where-Object { Test-Path $_ } | ForEach-Object {
+    Remove-Item -LiteralPath $_ -Recurse -Force
+}
+
 & $flutter pub get
 & $flutter build windows --release
 

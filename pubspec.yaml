@@ -1,5 +1,5 @@
 name: audioshare
-description: Android system audio streaming to Windows over a user-managed virtual network.
+description: Use a Windows PC as a Bluetooth A2DP audio receiver.
 publish_to: 'none'
 version: 0.1.0+1
 
@@ -9,9 +9,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  crypto: ^3.0.6
-  ffi: ^2.1.4
-  cupertino_icons: ^1.0.8
 
 dev_dependencies:
   flutter_test:

@@ -1,165 +1,132 @@
+import 'dart:async';
+
 import 'package:audioshare/main.dart';
-import 'package:audioshare/platform/windows_audio_player.dart';
-import 'package:audioshare/protocol/audio_packet.dart';
+import 'package:audioshare/platform/external_route_bridge.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+class FakeBridge extends ExternalRouteBridge {
+  List<BluetoothDeviceInfo> devices = const [];
+  int refreshes = 0;
+  bool started = false;
+  Completer<BluetoothSinkStatus>? startCompleter;
+
+  @override
+  Future<List<BluetoothDeviceInfo>> listBluetoothDevices() async {
+    refreshes++;
+    return devices;
+  }
+
+  @override
+  Future<BluetoothSinkStatus> startBluetoothSink({
+    required String deviceId,
+  }) async {
+    final pending = startCompleter;
+    if (pending != null) return pending.future;
+    started = true;
+    return const BluetoothSinkStatus(mode: 'connected', message: 'ok');
+  }
+
+  @override
+  Future<BluetoothSinkStatus> stopBluetoothSink() async {
+    started = false;
+    return const BluetoothSinkStatus(mode: 'stopped', message: '已停止蓝牙接收。');
+  }
+
+  @override
+  Future<BluetoothSinkStatus> getBluetoothSinkStatus() async =>
+      BluetoothSinkStatus(mode: started ? 'connected' : 'stopped', message: '');
+
+  @override
+  Future<void> openBluetoothSettings() async {}
+}
+
 void main() {
-  testWidgets('renders AudioShare shell and core controls', (tester) async {
-    await tester.pumpWidget(const AudioShareApp());
-
-    expect(find.text('AudioShare'), findsOneWidget);
-    expect(find.text('Android 推流'), findsOneWidget);
-    expect(find.text('Windows 接收'), findsOneWidget);
-    expect(find.text('公开捕获'), findsOneWidget);
-    expect(find.text('蓝牙路由'), findsOneWidget);
-    expect(find.text('投屏路由'), findsOneWidget);
-    expect(find.text('音频广播'), findsOneWidget);
-    expect(find.text('连接设置'), findsOneWidget);
+  testWidgets('Android is a Bluetooth-only guide', (tester) async {
+    await tester.pumpWidget(
+      AudioShareApp(bridge: FakeBridge(), platform: TargetPlatform.android),
+    );
+    expect(find.text('在手机上选择媒体输出'), findsOneWidget);
+    expect(find.text('打开系统蓝牙设置'), findsOneWidget);
+    expect(find.textContaining('采集'), findsOneWidget);
   });
 
-  testWidgets('can switch to Windows receiver mode', (tester) async {
-    await tester.pumpWidget(const AudioShareApp());
-
-    await tester.tap(find.text('Windows 接收'));
-    await tester.pumpAndSettle();
-
-    expect(find.text('Windows 音频接收'), findsOneWidget);
-    expect(find.text('开始监听'), findsOneWidget);
-  });
-
-  testWidgets('can switch to Windows bluetooth route mode', (tester) async {
-    await tester.pumpWidget(const AudioShareApp());
-
-    await tester.tap(find.text('Windows 接收'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('蓝牙路由'));
-    await tester.pumpAndSettle();
-
-    expect(find.text('蓝牙音频接收'), findsOneWidget);
-    expect(find.text('刷新蓝牙设备'), findsOneWidget);
-    expect(find.text('启动蓝牙接收'), findsOneWidget);
-    expect(find.textContaining('不是 AudioShare UDP 推流'), findsWidgets);
-  });
-
-  testWidgets('can switch to Windows audio broadcast scan mode', (
+  testWidgets('Windows empty list explains pairing before refresh', (
     tester,
   ) async {
-    await tester.pumpWidget(const AudioShareApp());
-
-    await tester.tap(find.text('Windows 接收'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('音频广播'));
-    await tester.pumpAndSettle();
-
-    expect(find.text('音频广播扫描'), findsOneWidget);
-    expect(find.text('扫描音频广播'), findsOneWidget);
-    expect(find.text('Auracast 扫描诊断'), findsWidgets);
-    expect(find.textContaining('不直接加入 BIS/LC3 音频'), findsOneWidget);
+    await tester.pumpWidget(
+      AudioShareApp(bridge: FakeBridge(), platform: TargetPlatform.windows),
+    );
+    await tester.pump();
+    expect(find.textContaining('先在 Windows 添加设备完成普通蓝牙配对，再刷新'), findsOneWidget);
   });
 
-  test('controller disables Android UDP start for external route modes', () {
-    final controller = AudioShareController();
-
-    controller.setSide(AppSide.android);
-    controller.capturePermissionGranted = true;
-    controller.setSourceMode(AudioSourceMode.bluetoothSink);
-
-    expect(controller.canStartAndroid, isFalse);
-    expect(controller.probeMessage, contains('不走 Tailscale'));
-
-    controller.setSourceMode(AudioSourceMode.wirelessDisplay);
-
-    expect(controller.canStartAndroid, isFalse);
-    expect(controller.lastMessage, contains('无线显示接收端'));
-
-    controller.setSourceMode(AudioSourceMode.auracastBroadcast);
-
-    expect(controller.canStartAndroid, isFalse);
-    expect(controller.lastMessage, contains('扫描 Auracast'));
+  testWidgets('refresh enumerates and auto-selects a single device', (
+    tester,
+  ) async {
+    final bridge = FakeBridge();
+    await tester.pumpWidget(
+      AudioShareApp(bridge: bridge, platform: TargetPlatform.windows),
+    );
+    await tester.pump();
+    bridge.devices = const [
+      BluetoothDeviceInfo(id: 'phone', name: 'My Phone', isConnected: false),
+    ];
+    await tester.tap(find.text('刷新设备'));
+    await tester.pump();
+    expect(find.text('My Phone'), findsOneWidget);
+    final dropdown = tester.widget<DropdownButtonFormField<String>>(
+      find.byKey(const Key('device-dropdown')),
+    );
+    expect(dropdown.initialValue, 'phone');
   });
 
-  test('controller validates port range', () {
-    final controller = AudioShareController();
-
-    controller.updatePort('70000');
-
-    expect(controller.status, LinkStatus.error);
-    expect(controller.lastMessage, contains('端口'));
+  testWidgets('start succeeds and stop returns to idle state', (tester) async {
+    final bridge = FakeBridge()
+      ..devices = const [
+        BluetoothDeviceInfo(id: 'phone', name: 'My Phone', isConnected: false),
+      ];
+    await tester.pumpWidget(
+      AudioShareApp(bridge: bridge, platform: TargetPlatform.windows),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('start-button')));
+    await tester.pump();
+    expect(find.textContaining('HyperOS 3'), findsOneWidget);
+    expect(find.byKey(const Key('stop-button')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('stop-button')));
+    await tester.pump();
+    expect(find.byKey(const Key('start-button')), findsOneWidget);
+    expect(find.text('已停止蓝牙接收。'), findsOneWidget);
   });
 
-  test('controller accepts Android pairing code entry and Windows refresh', () {
-    final controller = AudioShareController();
-
-    controller.updatePairingCode('123456');
-    expect(controller.pairingCode, '123456');
-
-    controller.refreshPairingCode();
-    expect(controller.pairingCode, matches(RegExp(r'^\d{3}-\d{3}$')));
-  });
-
-  test('Windows audio player is inert outside Windows', () {
-    final player = WindowsAudioPlayer();
-
-    final devices = player.listOutputDevices();
-    expect(devices, isNotEmpty);
-    expect(devices.first.id, 'default');
-
-    final started = player.start(
-      sampleRate: 48000,
-      channels: 2,
-      frameMs: 20,
-      bitrateKbps: 96,
-      bufferMs: 80,
+  testWidgets('a pending native start can be cancelled without stale state', (
+    tester,
+  ) async {
+    final pending = Completer<BluetoothSinkStatus>();
+    final bridge = FakeBridge()
+      ..devices = const [
+        BluetoothDeviceInfo(id: 'phone', name: 'My Phone', isConnected: false),
+      ]
+      ..startCompleter = pending;
+    await tester.pumpWidget(
+      AudioShareApp(bridge: bridge, platform: TargetPlatform.windows),
     );
+    await tester.pump();
 
-    if (started) {
-      player.stop();
-    } else {
-      expect(player.isStarted, isFalse);
-    }
-  });
+    await tester.tap(find.byKey(const Key('start-button')));
+    await tester.pump();
+    expect(find.text('取消启动'), findsOneWidget);
 
-  test('audio packet codec rejects wrong auth keys', () {
-    const packet = AudioPacket(
-      sessionId: 7,
-      sequence: 42,
-      timestampMs: 1234,
-      payload: [1, 2, 3, 4],
+    await tester.tap(find.byKey(const Key('stop-button')));
+    await tester.pump();
+    expect(find.byKey(const Key('start-button')), findsOneWidget);
+
+    pending.complete(
+      const BluetoothSinkStatus(mode: 'connected', message: 'stale'),
     );
-
-    final encoded = AudioPacketCodec.encode(packet, 'secret');
-    final decoded = AudioPacketCodec.decode(encoded, 'secret');
-
-    expect(decoded.sessionId, packet.sessionId);
-    expect(decoded.sequence, packet.sequence);
-    expect(decoded.timestampMs, packet.timestampMs);
-    expect(decoded.payload, packet.payload);
-    expect(
-      () => AudioPacketCodec.decode(encoded, 'wrong'),
-      throwsFormatException,
-    );
-  });
-
-  test('audio packet codec rejects malformed packet lengths', () {
-    const packet = AudioPacket(
-      sessionId: 7,
-      sequence: 42,
-      timestampMs: 1234,
-      payload: [1, 2, 3, 4],
-    );
-
-    final encoded = AudioPacketCodec.encode(packet, 'secret');
-
-    expect(
-      () => AudioPacketCodec.decode([...encoded, 0], 'secret'),
-      throwsFormatException,
-    );
-    expect(
-      () => AudioPacketCodec.decode(
-        encoded.sublist(0, encoded.length - 1),
-        'secret',
-      ),
-      throwsFormatException,
-    );
+    await tester.pump();
+    expect(find.byKey(const Key('start-button')), findsOneWidget);
+    expect(find.textContaining('接收已启动'), findsNothing);
   });
 }

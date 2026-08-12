@@ -3,25 +3,51 @@
 #include <flutter/encodable_value.h>
 #include <flutter/method_channel.h>
 #include <flutter/standard_method_codec.h>
-#include <endpointvolume.h>
-#include <mmdeviceapi.h>
 #include <roapi.h>
 #include <shellapi.h>
 #include <windows.h>
+#include <winrt/Windows.Devices.Enumeration.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Media.Audio.h>
+#include <winrt/base.h>
 
+#include <cstdint>
 #include <memory>
-#include <filesystem>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <variant>
 
 namespace {
 
+using flutter::EncodableList;
 using flutter::EncodableMap;
 using flutter::EncodableValue;
+using winrt::Windows::Devices::Enumeration::DeviceInformation;
+using winrt::Windows::Foundation::IAsyncInfo;
+using winrt::Windows::Media::Audio::AudioPlaybackConnection;
+using winrt::Windows::Media::Audio::AudioPlaybackConnectionOpenResultStatus;
+using winrt::Windows::Media::Audio::AudioPlaybackConnectionState;
 
 constexpr char kChannelName[] = "com.machinee.audioshare/external_route";
-HANDLE g_bluetooth_process = nullptr;
-std::wstring g_bluetooth_script_path;
+
+struct BluetoothState {
+  std::mutex mutex;
+  AudioPlaybackConnection connection{nullptr};
+  winrt::hstring device_id;
+  IAsyncInfo pending_operation{nullptr};
+  std::string message = "Bluetooth audio receiver is stopped.";
+  uint64_t generation = 0;
+  bool shutting_down = false;
+};
+
+struct BluetoothResources {
+  AudioPlaybackConnection connection{nullptr};
+  IAsyncInfo pending_operation{nullptr};
+  uint64_t generation = 0;
+};
 
 EncodableValue Status(const std::string& mode, const std::string& message) {
   return EncodableValue(EncodableMap{
@@ -30,392 +56,137 @@ EncodableValue Status(const std::string& mode, const std::string& message) {
   });
 }
 
-void StopBluetoothProcess() {
-  if (g_bluetooth_process != nullptr) {
-    TerminateProcess(g_bluetooth_process, 0);
-    CloseHandle(g_bluetooth_process);
-    g_bluetooth_process = nullptr;
+std::string ErrorMessage(const char* context, const winrt::hresult_error& error) {
+  std::string message(context);
+  message += ": ";
+  message += winrt::to_string(error.message());
+  return message;
+}
+
+BluetoothResources ResetBluetoothState(
+    const std::shared_ptr<BluetoothState>& state,
+    const std::string& message,
+    bool shutting_down = false) {
+  std::lock_guard<std::mutex> lock(state->mutex);
+  BluetoothResources resources{
+      state->connection,
+      state->pending_operation,
+      ++state->generation,
+  };
+  state->connection = nullptr;
+  state->device_id.clear();
+  state->pending_operation = nullptr;
+  state->message = message;
+  state->shutting_down = state->shutting_down || shutting_down;
+  return resources;
+}
+
+void CloseBluetoothResources(BluetoothResources resources) {
+  if (resources.pending_operation) {
+    try {
+      resources.pending_operation.Cancel();
+    } catch (const winrt::hresult_error&) {
+      // The operation may have completed between ResetBluetoothState and here.
+    }
   }
-  if (!g_bluetooth_script_path.empty()) {
-    DeleteFileW(g_bluetooth_script_path.c_str());
-    g_bluetooth_script_path.clear();
+  if (resources.connection) {
+    try {
+      resources.connection.Close();
+    } catch (const winrt::hresult_error&) {
+      // The device may already have disappeared. Releasing it is still required.
+    }
   }
 }
 
-std::wstring Utf16FromUtf8(const std::string& input) {
-  if (input.empty()) {
-    return std::wstring();
-  }
-  int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(),
-                                 static_cast<int>(input.size()), nullptr, 0);
-  if (size <= 0) {
-    return std::wstring();
-  }
-  std::wstring output(size, L'\0');
-  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(),
-                      static_cast<int>(input.size()), output.data(), size);
-  return output;
+bool IsCurrentGeneration(const std::shared_ptr<BluetoothState>& state,
+                         uint64_t generation) {
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return !state->shutting_down && state->generation == generation;
 }
 
-bool LaunchUri(const std::wstring& uri) {
-  HINSTANCE result =
-      ShellExecuteW(nullptr, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-  return reinterpret_cast<intptr_t>(result) > 32;
+bool SetPendingOperation(const std::shared_ptr<BluetoothState>& state,
+                         uint64_t generation,
+                         const IAsyncInfo& operation) {
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (state->shutting_down || state->generation != generation) {
+    return false;
+  }
+  state->pending_operation = operation;
+  return true;
 }
 
-EncodableValue RunPowerShellJson(const std::wstring& script) {
-  wchar_t temp_path[MAX_PATH];
-  if (GetTempPathW(MAX_PATH, temp_path) == 0) {
-    return Status("error", "Could not get temporary directory.");
+void ClearPendingOperation(const std::shared_ptr<BluetoothState>& state,
+                           uint64_t generation) {
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (state->generation == generation) {
+    state->pending_operation = nullptr;
   }
-
-  wchar_t temp_file[MAX_PATH];
-  if (GetTempFileNameW(temp_path, L"asr", 0, temp_file) == 0) {
-    return Status("error", "Could not create temporary script.");
-  }
-
-  HANDLE file = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_TEMPORARY, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    DeleteFileW(temp_file);
-    return Status("error", "Could not write temporary script.");
-  }
-
-  const wchar_t bom = 0xFEFF;
-  DWORD written = 0;
-  WriteFile(file, &bom, sizeof(bom), &written, nullptr);
-  WriteFile(file, script.data(), static_cast<DWORD>(script.size() * sizeof(wchar_t)),
-            &written, nullptr);
-  CloseHandle(file);
-
-  std::wstring command = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"";
-  command += temp_file;
-  command += L"\"";
-
-  wchar_t output_file[MAX_PATH];
-  GetTempFileNameW(temp_path, L"aso", 0, output_file);
-  command += L" > \"";
-  command += output_file;
-  command += L"\"";
-
-  STARTUPINFOW startup = {};
-  startup.cb = sizeof(startup);
-  PROCESS_INFORMATION process = {};
-  std::wstring mutable_command = command;
-  BOOL created = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr,
-                                FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
-                                &startup, &process);
-  if (!created) {
-    DeleteFileW(temp_file);
-    DeleteFileW(output_file);
-    return Status("error", "Could not start PowerShell helper.");
-  }
-
-  WaitForSingleObject(process.hProcess, 10000);
-  DWORD exit_code = 1;
-  GetExitCodeProcess(process.hProcess, &exit_code);
-  CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
-  DeleteFileW(temp_file);
-
-  HANDLE out = CreateFileW(output_file, GENERIC_READ, FILE_SHARE_READ, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (out == INVALID_HANDLE_VALUE) {
-    DeleteFileW(output_file);
-    return Status("error", "Could not read PowerShell helper output.");
-  }
-  DWORD size = GetFileSize(out, nullptr);
-  std::string bytes(size, '\0');
-  ReadFile(out, bytes.data(), size, &written, nullptr);
-  CloseHandle(out);
-  DeleteFileW(output_file);
-
-  if (exit_code != 0) {
-    return Status("error", "PowerShell helper failed.");
-  }
-  return EncodableValue(bytes);
 }
 
-EncodableValue RunExecutableJson(const std::wstring& executable,
-                                 const std::wstring& arguments,
-                                 DWORD timeout_ms) {
-  wchar_t temp_path[MAX_PATH];
-  if (GetTempPathW(MAX_PATH, temp_path) == 0) {
-    return Status("error", "Could not get temporary directory.");
+void SetConnectionError(const std::shared_ptr<BluetoothState>& state,
+                        uint64_t generation,
+                        const std::string& message) {
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (!state->shutting_down && state->generation == generation) {
+    state->pending_operation = nullptr;
+    state->message = message;
   }
-
-  wchar_t output_file[MAX_PATH];
-  if (GetTempFileNameW(temp_path, L"asa", 0, output_file) == 0) {
-    return Status("error", "Could not create helper output file.");
-  }
-
-  std::wstring command = L"\"";
-  command += executable;
-  command += L"\" ";
-  command += arguments;
-  command += L" --output \"";
-  command += output_file;
-  command += L"\"";
-
-  STARTUPINFOW startup = {};
-  startup.cb = sizeof(startup);
-  PROCESS_INFORMATION process = {};
-  std::wstring mutable_command = command;
-  BOOL created = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr,
-                                FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
-                                &startup, &process);
-  if (!created) {
-    DeleteFileW(output_file);
-    return Status("error", "Could not start Auracast scanner helper.");
-  }
-
-  const DWORD wait_result = WaitForSingleObject(process.hProcess, timeout_ms);
-  if (wait_result == WAIT_TIMEOUT) {
-    TerminateProcess(process.hProcess, 1);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    DeleteFileW(output_file);
-    return Status("error", "Auracast scanner helper timed out.");
-  }
-
-  DWORD exit_code = 1;
-  GetExitCodeProcess(process.hProcess, &exit_code);
-  CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
-
-  HANDLE out = CreateFileW(output_file, GENERIC_READ, FILE_SHARE_READ, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (out == INVALID_HANDLE_VALUE) {
-    DeleteFileW(output_file);
-    return Status("error", "Could not read Auracast scanner output.");
-  }
-  const DWORD size = GetFileSize(out, nullptr);
-  std::string bytes(size, '\0');
-  DWORD read = 0;
-  ReadFile(out, bytes.data(), size, &read, nullptr);
-  CloseHandle(out);
-  DeleteFileW(output_file);
-
-  if (exit_code != 0) {
-    return Status("error", "Auracast scanner helper failed.");
-  }
-  return EncodableValue(bytes);
 }
 
-EncodableValue StartPersistentBluetoothSink(const std::wstring& device_id) {
-  StopBluetoothProcess();
-
-  wchar_t temp_path[MAX_PATH];
-  if (GetTempPathW(MAX_PATH, temp_path) == 0) {
-    return Status("error", "Could not get temporary directory.");
+bool InstallConnection(const std::shared_ptr<BluetoothState>& state,
+                       uint64_t generation,
+                       const AudioPlaybackConnection& connection,
+                       const winrt::hstring& device_id) {
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (state->shutting_down || state->generation != generation) {
+    return false;
   }
+  state->pending_operation = nullptr;
+  state->connection = connection;
+  state->device_id = device_id;
+  state->message = "Bluetooth audio receiver is connected.";
+  return true;
+}
 
-  wchar_t script_file[MAX_PATH];
-  wchar_t ready_file[MAX_PATH];
-  if (GetTempFileNameW(temp_path, L"asb", 0, script_file) == 0 ||
-      GetTempFileNameW(temp_path, L"asr", 0, ready_file) == 0) {
-    return Status("error", "Could not create Bluetooth helper temp files.");
-  }
-  DeleteFileW(ready_file);
-
-  std::wstring script =
-      LR"ps(
-$ErrorActionPreference = 'Stop'
-$deviceId = @'
-)ps";
-  script += device_id;
-  script += LR"ps(
-'@
-$readyPath = @'
-)ps";
-  script += ready_file;
-  script += LR"ps(
-'@
-try {
-  $connection = [Windows.Media.Audio.AudioPlaybackConnection, Windows.Media, ContentType=WindowsRuntime]::TryCreateFromId($deviceId)
-  if ($null -eq $connection) {
-    [IO.File]::WriteAllText($readyPath, ([pscustomobject]@{ mode = 'error'; message = 'Could not create AudioPlaybackConnection for this device. Pair the phone first and confirm it supports remote audio playback.' } | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
-    Start-Sleep -Seconds 2
-    exit
-  }
+std::pair<winrt::hstring, std::string> ConnectedDevice(
+    const std::shared_ptr<BluetoothState>& state) {
+  std::lock_guard<std::mutex> lock(state->mutex);
   try {
-    $startResult = $connection.Start()
-    if ($startResult -is [bool] -and -not $startResult) {
-      throw 'AudioPlaybackConnection.Start returned false.'
+    if (state->connection &&
+        state->connection.State() == AudioPlaybackConnectionState::Opened) {
+      return {state->device_id, state->message};
     }
-  } catch {
-    throw ('Could not start AudioPlaybackConnection: ' + $_.Exception.Message)
+  } catch (const winrt::hresult_error&) {
+    // A disconnected device is reported as stopped below.
   }
-  try {
-    $openResult = $connection.Open()
-  } catch {
-    throw ('Could not open AudioPlaybackConnection: ' + $_.Exception.Message)
-  }
-  if ($null -eq $openResult) {
-    throw 'AudioPlaybackConnection.Open did not return an OpenResult.'
-  }
-  if ([string]$openResult.Status -ne 'Success') {
-    throw ('AudioPlaybackConnection.Open returned status: ' + [string]$openResult.Status)
-  }
-  [IO.File]::WriteAllText($readyPath, ([pscustomobject]@{ mode = 'enabled'; message = 'AudioPlaybackConnection is enabled and open. Select this PC from Android media output.' } | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
-  while ($true) { Start-Sleep -Seconds 3600 }
-} catch {
-  [IO.File]::WriteAllText($readyPath, ([pscustomobject]@{ mode = 'error'; message = ('Bluetooth audio receiver failed: ' + $_.Exception.Message) } | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
-  Start-Sleep -Seconds 2
+  return {winrt::hstring(), "Bluetooth audio receiver is stopped."};
 }
-)ps";
 
-  HANDLE file = CreateFileW(script_file, GENERIC_WRITE, 0, nullptr,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
-    DeleteFileW(script_file);
-    return Status("error", "Could not write Bluetooth helper script.");
-  }
-  const wchar_t bom = 0xFEFF;
-  DWORD written = 0;
-  WriteFile(file, &bom, sizeof(bom), &written, nullptr);
-  WriteFile(file, script.data(), static_cast<DWORD>(script.size() * sizeof(wchar_t)),
-            &written, nullptr);
-  CloseHandle(file);
-
-  std::wstring command =
-      L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"";
-  command += script_file;
-  command += L"\"";
-
-  STARTUPINFOW startup = {};
-  startup.cb = sizeof(startup);
-  PROCESS_INFORMATION process = {};
-  std::wstring mutable_command = command;
-  BOOL created = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr,
-                                FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
-                                &startup, &process);
-  if (!created) {
-    DeleteFileW(script_file);
-    return Status("error", "Could not start Bluetooth AudioPlaybackConnection helper.");
-  }
-  CloseHandle(process.hThread);
-
-  std::string bytes;
-  for (int attempt = 0; attempt < 100; ++attempt) {
-    HANDLE ready = CreateFileW(ready_file, GENERIC_READ, FILE_SHARE_READ, nullptr,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (ready != INVALID_HANDLE_VALUE) {
-      DWORD size = GetFileSize(ready, nullptr);
-      bytes.resize(size);
-      DWORD read = 0;
-      ReadFile(ready, bytes.data(), size, &read, nullptr);
-      CloseHandle(ready);
-      DeleteFileW(ready_file);
-      break;
-    }
-    DWORD exit_code = STILL_ACTIVE;
-    GetExitCodeProcess(process.hProcess, &exit_code);
-    if (exit_code != STILL_ACTIVE) {
-      break;
-    }
-    Sleep(100);
-  }
-
-  if (bytes.empty()) {
-    TerminateProcess(process.hProcess, 0);
-    CloseHandle(process.hProcess);
-    DeleteFileW(script_file);
-    DeleteFileW(ready_file);
-    return Status("error", "Bluetooth helper did not return startup status.");
-  }
-
-  if (bytes.find("\"mode\":\"enabled\"") != std::string::npos) {
-    g_bluetooth_process = process.hProcess;
-    g_bluetooth_script_path = script_file;
-  } else {
-    TerminateProcess(process.hProcess, 0);
-    CloseHandle(process.hProcess);
-    DeleteFileW(script_file);
-  }
-
-  return EncodableValue(bytes);
+template <typename Work>
+void RunInBackground(Work work) {
+  std::thread([work = std::move(work)]() mutable {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    work();
+    winrt::uninit_apartment();
+  }).detach();
 }
 
 std::string StringArg(const EncodableValue* args, const std::string& key) {
   if (!args || !std::holds_alternative<EncodableMap>(*args)) {
-    return std::string();
+    return {};
   }
   const auto& map = std::get<EncodableMap>(*args);
-  auto it = map.find(EncodableValue(key));
+  const auto it = map.find(EncodableValue(key));
   if (it == map.end() || !std::holds_alternative<std::string>(it->second)) {
-    return std::string();
+    return {};
   }
   return std::get<std::string>(it->second);
 }
 
-int IntArg(const EncodableValue* args, const std::string& key, int fallback) {
-  if (!args || !std::holds_alternative<EncodableMap>(*args)) {
-    return fallback;
-  }
-  const auto& map = std::get<EncodableMap>(*args);
-  auto it = map.find(EncodableValue(key));
-  if (it == map.end()) {
-    return fallback;
-  }
-  if (std::holds_alternative<int>(it->second)) {
-    return std::get<int>(it->second);
-  }
-  if (std::holds_alternative<int64_t>(it->second)) {
-    return static_cast<int>(std::get<int64_t>(it->second));
-  }
-  return fallback;
-}
-
-std::wstring CurrentExecutableDirectory() {
-  wchar_t path[MAX_PATH];
-  const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
-  if (length == 0 || length >= MAX_PATH) {
-    return std::wstring();
-  }
-  return std::filesystem::path(path).parent_path().wstring();
-}
-
-bool IsDefaultOutputActive() {
-  HRESULT init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-  const bool should_uninitialize = SUCCEEDED(init_result);
-  if (FAILED(init_result) && init_result != RPC_E_CHANGED_MODE) {
-    return false;
-  }
-
-  IMMDeviceEnumerator* enumerator = nullptr;
-  HRESULT result = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr,
-                                    CLSCTX_ALL, __uuidof(IMMDeviceEnumerator),
-                                    reinterpret_cast<void**>(&enumerator));
-  if (FAILED(result) || enumerator == nullptr) {
-    if (should_uninitialize) {
-      CoUninitialize();
-    }
-    return false;
-  }
-
-  bool active = false;
-  IMMDevice* device = nullptr;
-  result = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-  if (SUCCEEDED(result) && device != nullptr) {
-    IAudioMeterInformation* meter = nullptr;
-    result = device->Activate(__uuidof(IAudioMeterInformation), CLSCTX_ALL,
-                              nullptr, reinterpret_cast<void**>(&meter));
-    if (SUCCEEDED(result) && meter != nullptr) {
-      float peak = 0.0f;
-      if (SUCCEEDED(meter->GetPeakValue(&peak))) {
-        active = peak > 0.003f;
-      }
-      meter->Release();
-    }
-    device->Release();
-  }
-  enumerator->Release();
-
-  if (should_uninitialize) {
-    CoUninitialize();
-  }
-  return active;
+bool LaunchBluetoothSettings() {
+  const HINSTANCE result = ShellExecuteW(nullptr, L"open", L"ms-settings:bluetooth",
+                                         nullptr, nullptr, SW_SHOWNORMAL);
+  return reinterpret_cast<intptr_t>(result) > 32;
 }
 
 }  // namespace
@@ -427,111 +198,165 @@ std::function<void()> RegisterExternalRouteChannel(
 
   auto channel = std::make_shared<flutter::MethodChannel<EncodableValue>>(
       messenger, kChannelName, &flutter::StandardMethodCodec::GetInstance());
+  auto state = std::make_shared<BluetoothState>();
 
   channel->SetMethodCallHandler(
-      [channel](const flutter::MethodCall<EncodableValue>& call,
-                std::unique_ptr<flutter::MethodResult<EncodableValue>> result) {
+      [state](const flutter::MethodCall<EncodableValue>& call,
+              std::unique_ptr<flutter::MethodResult<EncodableValue>> result) {
         const auto& method = call.method_name();
         if (method == "listBluetoothDevices") {
-          const std::wstring script =
-              LR"ps(
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-function Await-Operation($operation, [Type]$resultType) {
-  $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() |
-    Where-Object {
-      $_.Name -eq 'AsTask' -and
-      $_.IsGenericMethod -and
-      $_.GetParameters().Count -eq 1 -and
-      $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
-    } |
-    Select-Object -First 1
-  $task = $asTask.MakeGenericMethod($resultType).Invoke($null, @($operation))
-  return $task.GetAwaiter().GetResult()
-}
-$selector = [Windows.Media.Audio.AudioPlaybackConnection, Windows.Media, ContentType=WindowsRuntime]::GetDeviceSelector()
-$operation = [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType=WindowsRuntime]::FindAllAsync($selector)
-$collectionType = [Windows.Devices.Enumeration.DeviceInformationCollection, Windows.Devices.Enumeration, ContentType=WindowsRuntime]
-$devices = Await-Operation $operation $collectionType
-$devices | ForEach-Object {
-  [pscustomobject]@{ id = $_.Id; name = $_.Name; isConnected = $false }
-} | ConvertTo-Json -Compress
-)ps";
-          auto value = RunPowerShellJson(script);
-          result->Success(value);
+          RunInBackground(
+              [state, result = std::move(result)]() mutable {
+                try {
+                  const auto devices = DeviceInformation::FindAllAsync(
+                                           AudioPlaybackConnection::GetDeviceSelector())
+                                           .get();
+                  const auto connected_device = ConnectedDevice(state).first;
+                  EncodableList list;
+                  for (const auto& device : devices) {
+                    list.emplace_back(EncodableMap{
+                        {EncodableValue("id"),
+                         EncodableValue(winrt::to_string(device.Id()))},
+                        {EncodableValue("name"),
+                         EncodableValue(winrt::to_string(device.Name()))},
+                        {EncodableValue("isConnected"),
+                         EncodableValue(!connected_device.empty() &&
+                                        device.Id() == connected_device)},
+                    });
+                  }
+                  result->Success(EncodableValue(list));
+                } catch (const winrt::hresult_error& error) {
+                  result->Error(
+                      "bluetooth_enumeration_failed",
+                      ErrorMessage("Could not enumerate Bluetooth audio devices", error));
+                }
+              });
           return;
         }
         if (method == "startBluetoothSink") {
-          const auto device_id = Utf16FromUtf8(StringArg(call.arguments(), "deviceId"));
+          const std::string device_id = StringArg(call.arguments(), "deviceId");
           if (device_id.empty()) {
-            auto value = Status("error", "Missing Bluetooth device ID.");
-            result->Success(value);
+            result->Success(Status("error", "Missing Bluetooth device ID."));
             return;
           }
-          auto value = StartPersistentBluetoothSink(device_id);
-          result->Success(value);
+          auto old_resources = ResetBluetoothState(
+              state, "Bluetooth audio receiver is starting.");
+          const uint64_t generation = old_resources.generation;
+          RunInBackground(
+              [state, old_resources = std::move(old_resources), generation,
+               device_id, result = std::move(result)]() mutable {
+                CloseBluetoothResources(std::move(old_resources));
+                AudioPlaybackConnection connection{nullptr};
+                try {
+                  if (!IsCurrentGeneration(state, generation)) {
+                    result->Success(Status("stopped", "Bluetooth startup was cancelled."));
+                    return;
+                  }
+
+                  const winrt::hstring id = winrt::to_hstring(device_id);
+                  connection = AudioPlaybackConnection::TryCreateFromId(id);
+                  if (!connection) {
+                    const std::string message =
+                        "Windows could not create a Bluetooth audio connection. Pair the phone first.";
+                    SetConnectionError(state, generation, message);
+                    result->Success(Status("error", message));
+                    return;
+                  }
+
+                  const auto start_operation = connection.StartAsync();
+                  if (!SetPendingOperation(
+                          state, generation, start_operation.as<IAsyncInfo>())) {
+                    start_operation.Cancel();
+                    connection.Close();
+                    result->Success(Status("stopped", "Bluetooth startup was cancelled."));
+                    return;
+                  }
+                  start_operation.get();
+                  ClearPendingOperation(state, generation);
+
+                  const auto open_operation = connection.OpenAsync();
+                  if (!SetPendingOperation(
+                          state, generation, open_operation.as<IAsyncInfo>())) {
+                    open_operation.Cancel();
+                    connection.Close();
+                    result->Success(Status("stopped", "Bluetooth startup was cancelled."));
+                    return;
+                  }
+                  const auto open_result = open_operation.get();
+                  ClearPendingOperation(state, generation);
+
+                  if (open_result.Status() !=
+                      AudioPlaybackConnectionOpenResultStatus::Success) {
+                    connection.Close();
+                    const std::string message =
+                        "Windows could not open the Bluetooth audio connection (status " +
+                        std::to_string(static_cast<int>(open_result.Status())) + ").";
+                    SetConnectionError(state, generation, message);
+                    result->Success(Status("error", message));
+                    return;
+                  }
+
+                  if (!InstallConnection(state, generation, connection, id)) {
+                    connection.Close();
+                    result->Success(Status("stopped", "Bluetooth startup was cancelled."));
+                    return;
+                  }
+                  result->Success(Status(
+                      "connected", "Bluetooth audio receiver is connected."));
+                } catch (const winrt::hresult_error& error) {
+                  if (connection) {
+                    try {
+                      connection.Close();
+                    } catch (const winrt::hresult_error&) {
+                    }
+                  }
+                  const bool current = IsCurrentGeneration(state, generation);
+                  const std::string message = current
+                      ? ErrorMessage("Bluetooth audio connection failed", error)
+                      : "Bluetooth startup was cancelled.";
+                  if (current) {
+                    SetConnectionError(state, generation, message);
+                  }
+                  result->Success(Status(current ? "error" : "stopped", message));
+                }
+              });
           return;
         }
         if (method == "stopBluetoothSink") {
-          StopBluetoothProcess();
-          auto value = Status("stopped", "Bluetooth audio receiver released.");
-          result->Success(value);
+          auto resources = ResetBluetoothState(
+              state, "Bluetooth audio receiver is stopped.");
+          RunInBackground(
+              [resources = std::move(resources)]() mutable {
+                CloseBluetoothResources(std::move(resources));
+              });
+          result->Success(Status("stopped", "Bluetooth audio receiver is stopped."));
           return;
         }
-        if (method == "scanAuracastBroadcasts") {
-          int seconds = IntArg(call.arguments(), "seconds", 12);
-          if (seconds < 3) {
-            seconds = 3;
-          } else if (seconds > 90) {
-            seconds = 90;
-          }
-          std::wstring helper = CurrentExecutableDirectory();
-          if (helper.empty()) {
-            auto value = Status("error", "Could not locate application directory.");
-            result->Success(value);
-            return;
-          }
-          helper += L"\\audioshare_auracast_scanner.exe";
-          if (GetFileAttributesW(helper.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            helper = CurrentExecutableDirectory() + L"\\AuracastScanner.exe";
-          }
-          if (GetFileAttributesW(helper.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            auto value = Status(
-                "error",
-                "Auracast scanner helper was not found. Build the Windows runner with dotnet installed.");
-            result->Success(value);
-            return;
-          }
-          std::wstring args = L"--seconds ";
-          args += std::to_wstring(seconds);
-          auto value = RunExecutableJson(helper, args,
-                                         static_cast<DWORD>((seconds + 5) * 1000));
-          result->Success(value);
+        if (method == "getBluetoothSinkStatus") {
+          const auto connected_device = ConnectedDevice(state);
+          result->Success(Status(connected_device.first.empty() ? "stopped" : "connected",
+                                 connected_device.second));
           return;
         }
-        if (method == "openWirelessDisplay") {
-          const bool opened =
-              LaunchUri(L"ms-settings:project") || LaunchUri(L"ms-settings:optionalfeatures");
-          auto value = Status(opened ? "ready" : "error",
-                              opened
-                                  ? "Opened Windows projection settings. Install or open Wireless Display."
-                                  : "Could not open Windows wireless display settings.");
-          result->Success(value);
-          return;
-        }
-        if (method == "isWindowsOutputActive") {
-          EncodableValue value(IsDefaultOutputActive());
-          result->Success(value);
+        if (method == "openBluetoothSettings") {
+          if (LaunchBluetoothSettings()) {
+            result->Success(Status("ready", "Opened Windows Bluetooth settings."));
+          } else {
+            result->Success(Status("error", "Could not open Windows Bluetooth settings."));
+          }
           return;
         }
         result->NotImplemented();
       });
 
-  return [channel, ro_initialized]() {
-    StopBluetoothProcess();
+  return [channel, state, ro_initialized]() {
     channel->SetMethodCallHandler(nullptr);
-    if (ro_initialized) {
-      RoUninitialize();
-    }
+    auto resources = ResetBluetoothState(
+        state, "Bluetooth audio receiver is stopped.", true);
+    RunInBackground(
+        [resources = std::move(resources)]() mutable {
+          CloseBluetoothResources(std::move(resources));
+        });
+    if (ro_initialized) RoUninitialize();
   };
 }
