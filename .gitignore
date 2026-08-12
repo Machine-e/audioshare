@@ -35,6 +35,8 @@ migrate_working_dir/
 /dist/
 /validation/
 **/target/
+**/bin/
+**/obj/
 
 # Symbolication related
 app.*.symbols

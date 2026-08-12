@@ -37,6 +37,25 @@ target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "ole32.lib" "runtimeobject.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
+find_program(DOTNET_EXECUTABLE dotnet)
+if(DOTNET_EXECUTABLE)
+  set(AURACAST_SCANNER_PROJECT
+    "${CMAKE_SOURCE_DIR}/auracast_scanner/AuracastScanner.csproj")
+  add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+    COMMAND "${DOTNET_EXECUTABLE}" publish "${AURACAST_SCANNER_PROJECT}"
+      -c Release
+      -r win-x64
+      --self-contained false
+      -p:PublishSingleFile=true
+      -p:PublishTrimmed=false
+      -o "$<TARGET_FILE_DIR:${BINARY_NAME}>"
+    COMMENT "Publishing audioshare_auracast_scanner helper"
+    VERBATIM
+  )
+else()
+  message(WARNING "dotnet was not found; Auracast scanner helper will not be built.")
+endif()
+
 find_program(CARGO_EXECUTABLE cargo
   HINTS "$ENV{USERPROFILE}/.cargo/bin")
 if(CARGO_EXECUTABLE)

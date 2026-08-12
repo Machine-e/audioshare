@@ -40,13 +40,19 @@ enum LinkProbeStatus { idle, checking, listening, reachable, failed }
 
 enum NetworkProvider { easyTier, tailscale, manual }
 
-enum AudioSourceMode { publicCapture, bluetoothSink, wirelessDisplay }
+enum AudioSourceMode {
+  publicCapture,
+  bluetoothSink,
+  wirelessDisplay,
+  auracastBroadcast,
+}
 
 extension AudioSourceModeLabel on AudioSourceMode {
   String get label => switch (this) {
     AudioSourceMode.publicCapture => '公开捕获',
     AudioSourceMode.bluetoothSink => '蓝牙路由',
     AudioSourceMode.wirelessDisplay => '投屏路由',
+    AudioSourceMode.auracastBroadcast => '音频广播',
   };
 }
 
@@ -191,6 +197,7 @@ class AudioShareController extends ChangeNotifier {
     mode: 'idle',
     message: '尚未启动外部路由',
   );
+  AuracastScanResult auracastScanResult = const AuracastScanResult.idle();
 
   Timer? _connectionProbeTimer;
   Timer? _externalRouteMeterTimer;
@@ -224,6 +231,11 @@ class AudioShareController extends ChangeNotifier {
       isWindowsMode &&
       sourceMode == AudioSourceMode.wirelessDisplay &&
       !isActive;
+  bool get canScanAuracastBroadcasts =>
+      isWindowsMode &&
+      sourceMode == AudioSourceMode.auracastBroadcast &&
+      !isActive &&
+      !_auracastScanInFlight;
   bool get canStartAndroid =>
       isAndroidMode &&
       isPublicCaptureMode &&
@@ -233,6 +245,7 @@ class AudioShareController extends ChangeNotifier {
   bool get canStop => isActive;
   bool get canTestConnection =>
       isAndroidMode && host.trim().isNotEmpty && !_probeInFlight;
+  bool _auracastScanInFlight = false;
 
   void setSide(AppSide next) {
     if (side == next) return;
@@ -272,11 +285,14 @@ class AudioShareController extends ChangeNotifier {
       AudioSourceMode.publicCapture => '公开捕获模式需要虚拟网 TCP/UDP 连接测试',
       AudioSourceMode.bluetoothSink => '蓝牙路由不走 Tailscale，先枚举已配对手机',
       AudioSourceMode.wirelessDisplay => '投屏路由不走 Tailscale，按系统无线显示流程操作',
+      AudioSourceMode.auracastBroadcast =>
+        '音频广播不走 Tailscale，Windows 先扫描 Auracast 扩展广播',
     };
     lastMessage = switch (mode) {
       AudioSourceMode.publicCapture => '公开捕获只支持允许 AudioPlaybackCapture 的应用',
       AudioSourceMode.bluetoothSink => 'Windows 将作为蓝牙音频接收端',
       AudioSourceMode.wirelessDisplay => 'Windows 将作为无线显示接收端',
+      AudioSourceMode.auracastBroadcast => 'Windows 将扫描 Auracast 广播用于诊断',
     };
     if (mode == AudioSourceMode.bluetoothSink && isWindowsMode) {
       unawaited(refreshBluetoothDevices());
@@ -396,6 +412,66 @@ class AudioShareController extends ChangeNotifier {
       );
       lastMessage = externalRouteStatus.message;
     }
+    notifyListeners();
+  }
+
+  Future<void> scanAuracastBroadcasts() async {
+    if (_auracastScanInFlight) return;
+    _auracastScanInFlight = true;
+    status = LinkStatus.pairing;
+    externalRouteStatus = const ExternalRouteStatus(
+      mode: 'scanning',
+      message: '正在扫描附近 Auracast / LE Audio 扩展广播',
+    );
+    lastMessage = '请保持 HyperOS 音频广播页面打开，Windows 正在扫描';
+    notifyListeners();
+    try {
+      auracastScanResult = await _externalRouteBridge.scanAuracastBroadcasts(
+        seconds: 12,
+      );
+      final found = auracastScanResult.broadcasts.isNotEmpty;
+      externalRouteStatus = ExternalRouteStatus(
+        mode: auracastScanResult.mode,
+        message: auracastScanResult.message,
+      );
+      status = found ? LinkStatus.paired : LinkStatus.idle;
+      runtimeStatus = runtimeStatus.copyWith(externalRouteActive: found);
+      lastMessage = found
+          ? '已发现 Auracast 广播；当前 Windows 服务仅提供扫描诊断，不直接接收 BIS/LC3 音频'
+          : auracastScanResult.message;
+    } on PlatformException catch (error) {
+      status = LinkStatus.error;
+      externalRouteStatus = ExternalRouteStatus(
+        mode: 'error',
+        message: error.message ?? 'Auracast 广播扫描失败',
+      );
+      lastMessage = externalRouteStatus.message;
+    } catch (error) {
+      status = LinkStatus.error;
+      externalRouteStatus = ExternalRouteStatus(
+        mode: 'error',
+        message: 'Auracast 广播扫描失败：$error',
+      );
+      lastMessage = externalRouteStatus.message;
+    } finally {
+      _auracastScanInFlight = false;
+      notifyListeners();
+    }
+  }
+
+  void explainAuracastBroadcast(AuracastBroadcast broadcast) {
+    externalRouteStatus = ExternalRouteStatus(
+      mode: 'diagnostic_only',
+      message:
+          '${broadcast.name.isEmpty ? broadcast.address : broadcast.name} 是扫描到的 BLE 扩展广播记录，不是 Windows 蓝牙设备列表里的可连接入口。Windows 蓝牙设置中出现的两个 Machine 的 Xiaomi 14 多半是手机 classic/LE 枚举项，点击连接后 2 秒断开不代表 Auracast 加入失败；当前 AudioShare 仍只能发现广播，不能直接加入 BIS/LC3 音频。',
+    );
+    runtimeStatus = runtimeStatus.copyWith(
+      externalRouteActive: false,
+      windowsOutputActive: false,
+    );
+    status = LinkStatus.idle;
+    lastMessage =
+        '不要在 Windows 蓝牙设备列表里点 Machine 的 Xiaomi 14；那不是 Auracast 广播加入入口。需要声音请用外接 Auracast 接收器，或系统明确提供的音频广播加入入口。';
     notifyListeners();
   }
 
@@ -1220,26 +1296,26 @@ class _HomeScreenState extends State<HomeScreen> {
                 constraints: const BoxConstraints(maxWidth: 1080),
                 child: Padding(
                   padding: const EdgeInsets.all(16),
-                  child: wide
-                      ? Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Expanded(
-                              child: _PrimaryPanel(controller: controller),
-                            ),
-                            const SizedBox(width: 16),
-                            SizedBox(
-                              width: 360,
-                              child: _SettingsPanel(
-                                controller: controller,
-                                hostController: hostController,
-                                portController: portController,
+                  child: SingleChildScrollView(
+                    child: wide
+                        ? Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: _PrimaryPanel(controller: controller),
                               ),
-                            ),
-                          ],
-                        )
-                      : SingleChildScrollView(
-                          child: Column(
+                              const SizedBox(width: 16),
+                              SizedBox(
+                                width: 360,
+                                child: _SettingsPanel(
+                                  controller: controller,
+                                  hostController: hostController,
+                                  portController: portController,
+                                ),
+                              ),
+                            ],
+                          )
+                        : Column(
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
                               _PrimaryPanel(controller: controller),
@@ -1251,7 +1327,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                             ],
                           ),
-                        ),
+                  ),
                 ),
               ),
             ),
@@ -1274,6 +1350,9 @@ class _PrimaryPanel extends StatelessWidget {
     if (controller.sourceMode == AudioSourceMode.wirelessDisplay) {
       return controller.isWindowsMode ? '无线显示接收' : '投屏系统路由';
     }
+    if (controller.sourceMode == AudioSourceMode.auracastBroadcast) {
+      return controller.isWindowsMode ? '音频广播扫描' : 'HyperOS 音频广播';
+    }
     return controller.isAndroidMode ? '系统音频推流' : 'Windows 音频接收';
   }
 
@@ -1290,6 +1369,10 @@ class _PrimaryPanel extends StatelessWidget {
       controller.isAndroidMode
           ? '打开投屏/无线显示/Smart View，让音频随系统投屏进入 Windows；这不是 UDP 推流。'
           : '打开 Windows 无线显示接收入口，等待 Android Cast/投屏连接，音频由系统投屏通道承载。',
+    AudioSourceMode.auracastBroadcast =>
+      controller.isAndroidMode
+          ? '在 HyperOS 音频广播页面开启 Auracast / LE Audio 广播；Windows 端只扫描和诊断广播。'
+          : '扫描附近 Auracast / LE Audio 扩展广播，确认 Windows 能发现广播；当前不直接加入 BIS/LC3 音频。',
   };
 
   @override
@@ -1332,6 +1415,11 @@ class _PrimaryPanel extends StatelessWidget {
               icon: Icon(Icons.cast_connected),
               label: Text('投屏路由'),
             ),
+            ButtonSegment(
+              value: AudioSourceMode.auracastBroadcast,
+              icon: Icon(Icons.spatial_audio_off_outlined),
+              label: Text('音频广播'),
+            ),
           ],
           selected: {controller.sourceMode},
           onSelectionChanged: controller.isActive
@@ -1370,6 +1458,14 @@ class _PrimaryPanel extends StatelessWidget {
                 )
               else
                 _ExternalRouteStatusCard(controller: controller),
+              if (controller.sourceMode ==
+                  AudioSourceMode.auracastBroadcast) ...[
+                const SizedBox(height: 16),
+                _AuracastScanResultCard(
+                  result: controller.auracastScanResult,
+                  onExplainBroadcast: controller.explainAuracastBroadcast,
+                ),
+              ],
               const SizedBox(height: 16),
               _RuntimeStatusCard(
                 sourceMode: controller.sourceMode,
@@ -1435,6 +1531,24 @@ class _AndroidActions extends StatelessWidget {
             onPressed: controller.openAndroidBluetoothSettings,
             icon: const Icon(Icons.bluetooth),
             label: const Text('改用蓝牙设置'),
+          ),
+        ],
+      );
+    }
+    if (controller.sourceMode == AudioSourceMode.auracastBroadcast) {
+      return Wrap(
+        spacing: 12,
+        runSpacing: 12,
+        children: [
+          FilledButton.icon(
+            onPressed: controller.openAndroidBluetoothSettings,
+            icon: const Icon(Icons.settings_bluetooth),
+            label: const Text('打开蓝牙设置'),
+          ),
+          OutlinedButton.icon(
+            onPressed: controller.openAndroidCastSettings,
+            icon: const Icon(Icons.cast),
+            label: const Text('改用投屏设置'),
           ),
         ],
       );
@@ -1541,6 +1655,26 @@ class _WindowsActions extends StatelessWidget {
                 : null,
             icon: const Icon(Icons.cast_connected),
             label: const Text('打开无线显示接收'),
+          ),
+          OutlinedButton.icon(
+            onPressed: controller.canStop ? controller.stop : null,
+            icon: const Icon(Icons.stop),
+            label: const Text('停止'),
+          ),
+        ],
+      );
+    }
+    if (controller.sourceMode == AudioSourceMode.auracastBroadcast) {
+      return Wrap(
+        spacing: 12,
+        runSpacing: 12,
+        children: [
+          FilledButton.icon(
+            onPressed: controller.canScanAuracastBroadcasts
+                ? controller.scanAuracastBroadcasts
+                : null,
+            icon: const Icon(Icons.spatial_audio_off_outlined),
+            label: const Text('扫描音频广播'),
           ),
           OutlinedButton.icon(
             onPressed: controller.canStop ? controller.stop : null,
@@ -1657,12 +1791,22 @@ class _SettingsPanel extends StatelessWidget {
             const SizedBox(height: 12),
           ] else ...[
             _RouteInstruction(
-              icon: controller.sourceMode == AudioSourceMode.bluetoothSink
-                  ? Icons.bluetooth_audio
-                  : Icons.cast_connected,
-              text: controller.sourceMode == AudioSourceMode.bluetoothSink
-                  ? '蓝牙路由由 Windows 和 Android 系统蓝牙栈承载，不使用虚拟网、配对码、UDP 或 Opus 设置。'
-                  : '投屏路由由 Wireless Display/Cast 承载，不使用虚拟网、配对码、UDP 或 Opus 设置。',
+              icon: switch (controller.sourceMode) {
+                AudioSourceMode.bluetoothSink => Icons.bluetooth_audio,
+                AudioSourceMode.wirelessDisplay => Icons.cast_connected,
+                AudioSourceMode.auracastBroadcast =>
+                  Icons.spatial_audio_off_outlined,
+                AudioSourceMode.publicCapture => Icons.settings_voice_outlined,
+              },
+              text: switch (controller.sourceMode) {
+                AudioSourceMode.bluetoothSink =>
+                  '蓝牙路由由 Windows 和 Android 系统蓝牙栈承载，不使用虚拟网、配对码、UDP 或 Opus 设置。',
+                AudioSourceMode.wirelessDisplay =>
+                  '投屏路由由 Wireless Display/Cast 承载，不使用虚拟网、配对码、UDP 或 Opus 设置。',
+                AudioSourceMode.auracastBroadcast =>
+                  '音频广播路线只扫描 Auracast / LE Audio 扩展广播用于诊断，不使用虚拟网、配对码、UDP 或 Opus 设置。',
+                AudioSourceMode.publicCapture => '公开捕获使用虚拟网、配对码、UDP 和 Opus 设置。',
+              },
             ),
           ],
           DropdownMenu<String>(
@@ -1797,6 +1941,19 @@ class _ExternalRouteChecklist extends StatelessWidget {
               '选择 Windows PC；AudioShare 不启动 UDP 推流。',
             ];
     }
+    if (controller.sourceMode == AudioSourceMode.auracastBroadcast) {
+      return controller.isWindowsMode
+          ? const [
+              '在 Android / HyperOS 3 上开启“音频广播”并保持二维码页面打开。',
+              '点击扫描音频广播，等待 Windows 捕获扩展广播事件。',
+              '如能发现广播，说明可做诊断；实际听声仍需 Auracast 兼容接收器。',
+            ]
+          : const [
+              '从系统蓝牙或声音入口打开“音频广播”。',
+              '保持广播和二维码页面开启，避免因无设备连接而自动关闭。',
+              'Windows 端扫描只能确认广播存在，不能替代 Auracast 音频接收器。',
+            ];
+    }
     return controller.isWindowsMode
         ? const [
             '安装并打开 Windows Wireless Display / 投影到此电脑入口。',
@@ -1882,9 +2039,12 @@ class _RuntimeStatusCard extends StatelessWidget {
               enabled: status.windowsOutputActive,
             ),
             _StatusRow(
-              label: sourceMode == AudioSourceMode.bluetoothSink
-                  ? '蓝牙接收通道'
-                  : '无线显示通道',
+              label: switch (sourceMode) {
+                AudioSourceMode.bluetoothSink => '蓝牙接收通道',
+                AudioSourceMode.wirelessDisplay => '无线显示通道',
+                AudioSourceMode.auracastBroadcast => 'Auracast 扫描诊断',
+                AudioSourceMode.publicCapture => '公开捕获通道',
+              },
               enabled: status.externalRouteActive,
             ),
           ],
@@ -1944,6 +2104,8 @@ class _CompatibilityCard extends StatelessWidget {
       '蓝牙路由是系统媒体输出路径，不是 AudioShare UDP 推流。请先在 Windows 配对 Android，再在 Android 媒体输出中选择这台 PC。',
     AudioSourceMode.wirelessDisplay =>
       '投屏路由是系统 Cast/Wireless Display 路径，不是 AudioShare UDP 推流。Android 厂商入口可能显示为投屏、无线显示、屏幕镜像、Smart View 或 Cast。',
+    AudioSourceMode.auracastBroadcast =>
+      '音频广播是 Bluetooth LE Audio / Auracast 路线。Windows 当前只做扩展广播扫描和诊断，不承诺直接加入 Auracast BIS/LC3 音频；Windows 蓝牙设备列表里的手机项不是 Auracast 加入入口，点击后 2 秒断开与广播扫描不是同一条链路。需要听声时优先使用外接 Auracast 接收器。',
   };
 
   @override
@@ -1989,9 +2151,12 @@ class _ExternalRouteStatusCard extends StatelessWidget {
         : active
         ? Colors.green
         : Colors.blue;
-    final title = controller.sourceMode == AudioSourceMode.bluetoothSink
-        ? '蓝牙外部路由状态'
-        : '无线显示外部路由状态';
+    final title = switch (controller.sourceMode) {
+      AudioSourceMode.bluetoothSink => '蓝牙外部路由状态',
+      AudioSourceMode.wirelessDisplay => '无线显示外部路由状态',
+      AudioSourceMode.auracastBroadcast => '音频广播扫描状态',
+      AudioSourceMode.publicCapture => '外部路由状态',
+    };
 
     return DecoratedBox(
       decoration: BoxDecoration(
@@ -2033,21 +2198,174 @@ class _ExternalRouteStatusCard extends StatelessWidget {
                 color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
-            const SizedBox(height: 10),
-            LinearProgressIndicator(
-              value: controller.runtimeStatus.windowsOutputActive ? 1 : 0,
-              minHeight: 6,
-              color: color,
-              backgroundColor: color.withValues(alpha: 0.15),
+            if (controller.sourceMode != AudioSourceMode.auracastBroadcast) ...[
+              const SizedBox(height: 10),
+              LinearProgressIndicator(
+                value: controller.runtimeStatus.windowsOutputActive ? 1 : 0,
+                minHeight: 6,
+                color: color,
+                backgroundColor: color.withValues(alpha: 0.15),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                controller.runtimeStatus.windowsOutputActive
+                    ? 'Windows 默认输出设备检测到音频活动'
+                    : '等待 Windows 默认输出设备出现音频活动',
+                style: theme.textTheme.bodySmall,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AuracastScanResultCard extends StatelessWidget {
+  const _AuracastScanResultCard({
+    required this.result,
+    required this.onExplainBroadcast,
+  });
+
+  final AuracastScanResult result;
+  final ValueChanged<AuracastBroadcast> onExplainBroadcast;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final hasBroadcasts = result.broadcasts.isNotEmpty;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.radar),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Auracast 扫描诊断',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                Text(result.mode, style: theme.textTheme.labelLarge),
+              ],
             ),
             const SizedBox(height: 8),
             Text(
-              controller.runtimeStatus.windowsOutputActive
-                  ? 'Windows 默认输出设备检测到音频活动'
-                  : '等待 Windows 默认输出设备出现音频活动',
+              '扫描 ${result.scanSeconds}s，BLE 事件 ${result.totalEvents}，命中 ${result.matchedEvents}',
               style: theme.textTheme.bodySmall,
             ),
+            const SizedBox(height: 6),
+            Text(
+              result.joinApiAvailable
+                  ? '检测到可用加入 API'
+                  : '未发现可用 Windows Auracast 音频加入 API',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: result.joinApiAvailable ? Colors.green : Colors.orange,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            if (result.joinApiNote.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(result.joinApiNote, style: theme.textTheme.bodySmall),
+            ],
+            if (hasBroadcasts) ...[
+              const SizedBox(height: 10),
+              for (final broadcast in result.broadcasts)
+                _AuracastBroadcastTile(
+                  broadcast: broadcast,
+                  onExplainBroadcast: onExplainBroadcast,
+                ),
+            ] else ...[
+              const SizedBox(height: 10),
+              Text(
+                '暂无广播记录。请先在 HyperOS 音频广播页面开启广播，再立即扫描。',
+                style: theme.textTheme.bodySmall,
+              ),
+            ],
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AuracastBroadcastTile extends StatelessWidget {
+  const _AuracastBroadcastTile({
+    required this.broadcast,
+    required this.onExplainBroadcast,
+  });
+
+  final AuracastBroadcast broadcast;
+  final ValueChanged<AuracastBroadcast> onExplainBroadcast;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final dataSections = broadcast.dataSections
+        .map((section) => '${section.type}/${section.bytes}B')
+        .join(', ');
+    final serviceUuids = broadcast.serviceUuids.join(', ');
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: () => onExplainBroadcast(broadcast),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              border: Border.all(color: scheme.outlineVariant),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          broadcast.name.isEmpty ? '未命名广播' : broadcast.name,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      Text(
+                        '点击查看诊断',
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: scheme.primary,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text('地址 ${broadcast.address}，RSSI ${broadcast.rssi} dBm'),
+                  Text(
+                    '类型 ${broadcast.advertisementType}，事件 ${broadcast.events}',
+                  ),
+                  if (dataSections.isNotEmpty)
+                    Text('Data sections: $dataSections'),
+                  if (serviceUuids.isNotEmpty) Text('UUID: $serviceUuids'),
+                ],
+              ),
+            ),
+          ),
         ),
       ),
     );

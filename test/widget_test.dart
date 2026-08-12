@@ -13,6 +13,7 @@ void main() {
     expect(find.text('公开捕获'), findsOneWidget);
     expect(find.text('蓝牙路由'), findsOneWidget);
     expect(find.text('投屏路由'), findsOneWidget);
+    expect(find.text('音频广播'), findsOneWidget);
     expect(find.text('连接设置'), findsOneWidget);
   });
 
@@ -40,6 +41,22 @@ void main() {
     expect(find.textContaining('不是 AudioShare UDP 推流'), findsWidgets);
   });
 
+  testWidgets('can switch to Windows audio broadcast scan mode', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const AudioShareApp());
+
+    await tester.tap(find.text('Windows 接收'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('音频广播'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('音频广播扫描'), findsOneWidget);
+    expect(find.text('扫描音频广播'), findsOneWidget);
+    expect(find.text('Auracast 扫描诊断'), findsWidgets);
+    expect(find.textContaining('不直接加入 BIS/LC3 音频'), findsOneWidget);
+  });
+
   test('controller disables Android UDP start for external route modes', () {
     final controller = AudioShareController();
 
@@ -54,6 +71,11 @@ void main() {
 
     expect(controller.canStartAndroid, isFalse);
     expect(controller.lastMessage, contains('无线显示接收端'));
+
+    controller.setSourceMode(AudioSourceMode.auracastBroadcast);
+
+    expect(controller.canStartAndroid, isFalse);
+    expect(controller.lastMessage, contains('扫描 Auracast'));
   });
 
   test('controller validates port range', () {

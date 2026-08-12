@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <memory>
+#include <filesystem>
 #include <string>
 #include <variant>
 
@@ -135,6 +136,72 @@ EncodableValue RunPowerShellJson(const std::wstring& script) {
   return EncodableValue(bytes);
 }
 
+EncodableValue RunExecutableJson(const std::wstring& executable,
+                                 const std::wstring& arguments,
+                                 DWORD timeout_ms) {
+  wchar_t temp_path[MAX_PATH];
+  if (GetTempPathW(MAX_PATH, temp_path) == 0) {
+    return Status("error", "Could not get temporary directory.");
+  }
+
+  wchar_t output_file[MAX_PATH];
+  if (GetTempFileNameW(temp_path, L"asa", 0, output_file) == 0) {
+    return Status("error", "Could not create helper output file.");
+  }
+
+  std::wstring command = L"\"";
+  command += executable;
+  command += L"\" ";
+  command += arguments;
+  command += L" --output \"";
+  command += output_file;
+  command += L"\"";
+
+  STARTUPINFOW startup = {};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process = {};
+  std::wstring mutable_command = command;
+  BOOL created = CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr,
+                                FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                                &startup, &process);
+  if (!created) {
+    DeleteFileW(output_file);
+    return Status("error", "Could not start Auracast scanner helper.");
+  }
+
+  const DWORD wait_result = WaitForSingleObject(process.hProcess, timeout_ms);
+  if (wait_result == WAIT_TIMEOUT) {
+    TerminateProcess(process.hProcess, 1);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    DeleteFileW(output_file);
+    return Status("error", "Auracast scanner helper timed out.");
+  }
+
+  DWORD exit_code = 1;
+  GetExitCodeProcess(process.hProcess, &exit_code);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+
+  HANDLE out = CreateFileW(output_file, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (out == INVALID_HANDLE_VALUE) {
+    DeleteFileW(output_file);
+    return Status("error", "Could not read Auracast scanner output.");
+  }
+  const DWORD size = GetFileSize(out, nullptr);
+  std::string bytes(size, '\0');
+  DWORD read = 0;
+  ReadFile(out, bytes.data(), size, &read, nullptr);
+  CloseHandle(out);
+  DeleteFileW(output_file);
+
+  if (exit_code != 0) {
+    return Status("error", "Auracast scanner helper failed.");
+  }
+  return EncodableValue(bytes);
+}
+
 EncodableValue StartPersistentBluetoothSink(const std::wstring& device_id) {
   StopBluetoothProcess();
 
@@ -171,8 +238,25 @@ try {
     Start-Sleep -Seconds 2
     exit
   }
-  $null = $connection.StartAsync().GetAwaiter().GetResult()
-  $null = $connection.OpenAsync().GetAwaiter().GetResult()
+  try {
+    $startResult = $connection.Start()
+    if ($startResult -is [bool] -and -not $startResult) {
+      throw 'AudioPlaybackConnection.Start returned false.'
+    }
+  } catch {
+    throw ('Could not start AudioPlaybackConnection: ' + $_.Exception.Message)
+  }
+  try {
+    $openResult = $connection.Open()
+  } catch {
+    throw ('Could not open AudioPlaybackConnection: ' + $_.Exception.Message)
+  }
+  if ($null -eq $openResult) {
+    throw 'AudioPlaybackConnection.Open did not return an OpenResult.'
+  }
+  if ([string]$openResult.Status -ne 'Success') {
+    throw ('AudioPlaybackConnection.Open returned status: ' + [string]$openResult.Status)
+  }
   [IO.File]::WriteAllText($readyPath, ([pscustomobject]@{ mode = 'enabled'; message = 'AudioPlaybackConnection is enabled and open. Select this PC from Android media output.' } | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
   while ($true) { Start-Sleep -Seconds 3600 }
 } catch {
@@ -265,6 +349,33 @@ std::string StringArg(const EncodableValue* args, const std::string& key) {
   return std::get<std::string>(it->second);
 }
 
+int IntArg(const EncodableValue* args, const std::string& key, int fallback) {
+  if (!args || !std::holds_alternative<EncodableMap>(*args)) {
+    return fallback;
+  }
+  const auto& map = std::get<EncodableMap>(*args);
+  auto it = map.find(EncodableValue(key));
+  if (it == map.end()) {
+    return fallback;
+  }
+  if (std::holds_alternative<int>(it->second)) {
+    return std::get<int>(it->second);
+  }
+  if (std::holds_alternative<int64_t>(it->second)) {
+    return static_cast<int>(std::get<int64_t>(it->second));
+  }
+  return fallback;
+}
+
+std::wstring CurrentExecutableDirectory() {
+  wchar_t path[MAX_PATH];
+  const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+  if (length == 0 || length >= MAX_PATH) {
+    return std::wstring();
+  }
+  return std::filesystem::path(path).parent_path().wstring();
+}
+
 bool IsDefaultOutputActive() {
   HRESULT init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   const bool should_uninitialize = SUCCEEDED(init_result);
@@ -325,8 +436,23 @@ std::function<void()> RegisterExternalRouteChannel(
           const std::wstring script =
               LR"ps(
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+function Await-Operation($operation, [Type]$resultType) {
+  $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() |
+    Where-Object {
+      $_.Name -eq 'AsTask' -and
+      $_.IsGenericMethod -and
+      $_.GetParameters().Count -eq 1 -and
+      $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    } |
+    Select-Object -First 1
+  $task = $asTask.MakeGenericMethod($resultType).Invoke($null, @($operation))
+  return $task.GetAwaiter().GetResult()
+}
 $selector = [Windows.Media.Audio.AudioPlaybackConnection, Windows.Media, ContentType=WindowsRuntime]::GetDeviceSelector()
-$devices = [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType=WindowsRuntime]::FindAllAsync($selector).GetAwaiter().GetResult()
+$operation = [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType=WindowsRuntime]::FindAllAsync($selector)
+$collectionType = [Windows.Devices.Enumeration.DeviceInformationCollection, Windows.Devices.Enumeration, ContentType=WindowsRuntime]
+$devices = Await-Operation $operation $collectionType
 $devices | ForEach-Object {
   [pscustomobject]@{ id = $_.Id; name = $_.Name; isConnected = $false }
 } | ConvertTo-Json -Compress
@@ -349,6 +475,37 @@ $devices | ForEach-Object {
         if (method == "stopBluetoothSink") {
           StopBluetoothProcess();
           auto value = Status("stopped", "Bluetooth audio receiver released.");
+          result->Success(value);
+          return;
+        }
+        if (method == "scanAuracastBroadcasts") {
+          int seconds = IntArg(call.arguments(), "seconds", 12);
+          if (seconds < 3) {
+            seconds = 3;
+          } else if (seconds > 90) {
+            seconds = 90;
+          }
+          std::wstring helper = CurrentExecutableDirectory();
+          if (helper.empty()) {
+            auto value = Status("error", "Could not locate application directory.");
+            result->Success(value);
+            return;
+          }
+          helper += L"\\audioshare_auracast_scanner.exe";
+          if (GetFileAttributesW(helper.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            helper = CurrentExecutableDirectory() + L"\\AuracastScanner.exe";
+          }
+          if (GetFileAttributesW(helper.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            auto value = Status(
+                "error",
+                "Auracast scanner helper was not found. Build the Windows runner with dotnet installed.");
+            result->Success(value);
+            return;
+          }
+          std::wstring args = L"--seconds ";
+          args += std::to_wstring(seconds);
+          auto value = RunExecutableJson(helper, args,
+                                         static_cast<DWORD>((seconds + 5) * 1000));
           result->Success(value);
           return;
         }
