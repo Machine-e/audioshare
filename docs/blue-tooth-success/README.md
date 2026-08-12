@@ -7,7 +7,7 @@
 AudioShare 只支持以下 classic Bluetooth 路线：
 
 ```text
-Android / HyperOS 媒体输出
+Android 媒体或音频输出
   -> classic Bluetooth A2DP
   -> Windows AudioPlaybackConnection（A2DP Sink）
   -> Windows 当前默认音频输出设备
@@ -36,7 +36,8 @@ PowerShell 5.1 将 WinRT 对象暴露为 `System.__ComObject`，不能直接调�
 1. 在 Windows 和手机的系统蓝牙设置中完成普通蓝牙配对。
 2. 启动 AudioShare Windows 端并刷新已配对设备。
 3. 选择目标手机并启动蓝牙音频接收，确认连接已启用。
-4. 在 Android/HyperOS 的媒体输出选择器中选择当前 Windows PC。
+4. 在 Android 的媒体输出、音频输出或播放设备选择器中选择当前 Windows PC；
+   不同品牌的入口名称和位置可能不同。
 5. 播放音乐；声音应从 Windows 当前默认输出设备发出。
 6. 播放期间保持 AudioShare 运行，结束时在 AudioShare 中停止接收。
 

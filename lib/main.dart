@@ -66,7 +66,9 @@ class AudioShareController extends ChangeNotifier {
       final status = await bridge.startBluetoothSink(deviceId: id);
       if (_disposed || operation != _operation) return;
       connected = status.isConnected;
-      message = connected ? '接收已启动。请在 HyperOS 3 的媒体输出中选择此电脑。' : status.message;
+      message = connected
+          ? '接收已启动。请在手机的媒体或音频输出选择器中选择此电脑。'
+          : status.message;
       if (connected) _beginPolling();
     } catch (error) {
       if (!_disposed && operation == _operation) {
@@ -123,7 +125,7 @@ class AudioShareController extends ChangeNotifier {
         connected = false;
         message =
             '蓝牙连接已断开。请确认手机仍已配对，在 Windows 重新启动接收，'
-            '再从 HyperOS 3 媒体输出选择此电脑。';
+            '再从手机的媒体或音频输出选择器中选择此电脑。';
         _notify();
       }
     } catch (_) {
@@ -246,10 +248,10 @@ class _WindowsContent extends StatelessWidget {
             style: Theme.of(context).textTheme.headlineMedium,
           ),
           const SizedBox(height: 8),
-          const Text('从已配对的手机接收系统蓝牙音频。无需局域网、采集或额外传输。'),
+          const Text('从支持经典蓝牙 A2DP 的 Android 手机接收媒体音频。无需局域网、采集或额外传输。'),
           const SizedBox(height: 24),
           if (controller.devices.isEmpty && !controller.loading)
-            const Text('未找到可用手机。先在 Windows 添加设备完成普通蓝牙配对，再刷新。')
+            const Text('未找到可用手机。请先完成系统蓝牙配对，并确认手机已为此电脑启用“媒体音频”，再刷新。')
           else
             DropdownButtonFormField<String>(
               key: const Key('device-dropdown'),
@@ -314,7 +316,7 @@ class _WindowsContent extends StatelessWidget {
           ],
           if (controller.connected) ...[
             const SizedBox(height: 12),
-            const Text('已连接。请在手机媒体输出中选择此电脑并播放；实际声音以 Windows 为准。'),
+            const Text('已连接。请在手机的媒体输出、音频输出或播放设备中选择此电脑并播放。'),
           ],
         ],
       ),
@@ -330,11 +332,12 @@ class _AndroidContent extends StatelessWidget {
   Widget build(BuildContext context) => Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
-      Text('在手机上选择媒体输出', style: Theme.of(context).textTheme.headlineMedium),
+      Text('将电脑选为手机音频输出', style: Theme.of(context).textTheme.headlineMedium),
       const SizedBox(height: 12),
       const Text(
         '本应用不采集或传输音频。请先与 Windows 电脑完成普通蓝牙配对，'
-        '然后在 HyperOS 3 的媒体输出中选择此电脑。',
+        '并为此电脑启用“媒体音频”。播放媒体时，在系统的媒体输出、音频输出或播放设备中选择此电脑。'
+        '不同品牌的入口名称和位置可能不同。',
       ),
       const SizedBox(height: 20),
       FilledButton.icon(

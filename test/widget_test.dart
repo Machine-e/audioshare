@@ -46,9 +46,9 @@ void main() {
     await tester.pumpWidget(
       AudioShareApp(bridge: FakeBridge(), platform: TargetPlatform.android),
     );
-    expect(find.text('在手机上选择媒体输出'), findsOneWidget);
+    expect(find.text('将电脑选为手机音频输出'), findsOneWidget);
     expect(find.text('打开系统蓝牙设置'), findsOneWidget);
-    expect(find.textContaining('采集'), findsOneWidget);
+    expect(find.textContaining('不同品牌'), findsOneWidget);
   });
 
   testWidgets('Windows empty list explains pairing before refresh', (
@@ -58,7 +58,7 @@ void main() {
       AudioShareApp(bridge: FakeBridge(), platform: TargetPlatform.windows),
     );
     await tester.pump();
-    expect(find.textContaining('先在 Windows 添加设备完成普通蓝牙配对，再刷新'), findsOneWidget);
+    expect(find.textContaining('确认手机已为此电脑启用“媒体音频”'), findsOneWidget);
   });
 
   testWidgets('refresh enumerates and auto-selects a single device', (
@@ -92,7 +92,7 @@ void main() {
     await tester.pump();
     await tester.tap(find.byKey(const Key('start-button')));
     await tester.pump();
-    expect(find.textContaining('HyperOS 3'), findsOneWidget);
+    expect(find.textContaining('媒体或音频输出选择器'), findsOneWidget);
     expect(find.byKey(const Key('stop-button')), findsOneWidget);
     await tester.tap(find.byKey(const Key('stop-button')));
     await tester.pump();
