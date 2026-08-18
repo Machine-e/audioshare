@@ -6,41 +6,37 @@ class BluetoothDeviceInfo {
   const BluetoothDeviceInfo({
     required this.id,
     required this.name,
-    required this.isConnected,
+    this.isSelectedSink = false,
   });
-
   final String id;
   final String name;
-  final bool isConnected;
+  final bool isSelectedSink;
 
   factory BluetoothDeviceInfo.fromMap(Map<dynamic, dynamic> map) =>
       BluetoothDeviceInfo(
         id: map['id']?.toString() ?? '',
         name: map['name']?.toString() ?? '未知设备',
-        isConnected: map['isConnected'] == true,
+        isSelectedSink: map['isSelectedSink'] == true,
       );
 }
 
-class BluetoothSinkStatus {
-  const BluetoothSinkStatus({required this.mode, required this.message});
+enum NativeSinkState { stopped, waitingForRoute, opened, disconnected, error }
 
-  final String mode;
+class BluetoothSinkStatus {
+  const BluetoothSinkStatus({required this.state, required this.message});
+  final NativeSinkState state;
   final String message;
 
-  bool get isConnected => const {
-    'connected',
-    'running',
-    'started',
-    'active',
-    'enabled',
-    'playing',
-  }.contains(mode.toLowerCase());
-
-  factory BluetoothSinkStatus.fromMap(Map<dynamic, dynamic> map) =>
-      BluetoothSinkStatus(
-        mode: map['mode']?.toString() ?? 'unknown',
-        message: map['message']?.toString() ?? '',
-      );
+  factory BluetoothSinkStatus.fromMap(Map<dynamic, dynamic> map) {
+    final raw = map['mode']?.toString();
+    final state = NativeSinkState.values
+        .where((value) => value.name == raw)
+        .firstOrNull;
+    return BluetoothSinkStatus(
+      state: state ?? NativeSinkState.error,
+      message: state == null ? '原生端返回了无效状态。' : map['message']?.toString() ?? '',
+    );
+  }
 }
 
 class ExternalRouteBridge {
@@ -50,9 +46,7 @@ class ExternalRouteBridge {
 
   Future<List<BluetoothDeviceInfo>> listBluetoothDevices() async {
     if (!Platform.isWindows) return const [];
-    final dynamic value = await _channel.invokeMethod<dynamic>(
-      'listBluetoothDevices',
-    );
+    final value = await _channel.invokeMethod<dynamic>('listBluetoothDevices');
     if (value is! List) return const [];
     return value
         .whereType<Map<dynamic, dynamic>>()
@@ -62,51 +56,45 @@ class ExternalRouteBridge {
 
   Future<BluetoothSinkStatus> startBluetoothSink({
     required String deviceId,
-  }) async {
-    if (!Platform.isWindows) {
-      return const BluetoothSinkStatus(
-        mode: 'unsupported',
-        message: '当前平台不支持蓝牙接收。',
-      );
-    }
-    return _status(
-      await _channel.invokeMethod<dynamic>('startBluetoothSink', {
-        'deviceId': deviceId,
-      }),
-    );
-  }
+  }) async => Platform.isWindows
+      ? _status(
+          await _channel.invokeMethod<dynamic>('startBluetoothSink', {
+            'deviceId': deviceId,
+          }),
+        )
+      : const BluetoothSinkStatus(
+          state: NativeSinkState.error,
+          message: '当前平台不支持蓝牙接收。',
+        );
 
-  Future<BluetoothSinkStatus> stopBluetoothSink() async {
-    if (!Platform.isWindows) {
-      return const BluetoothSinkStatus(
-        mode: 'unsupported',
-        message: '当前平台不支持蓝牙接收。',
-      );
-    }
-    return _status(await _channel.invokeMethod<dynamic>('stopBluetoothSink'));
-  }
+  Future<BluetoothSinkStatus> stopBluetoothSink() async => Platform.isWindows
+      ? _status(await _channel.invokeMethod<dynamic>('stopBluetoothSink'))
+      : const BluetoothSinkStatus(
+          state: NativeSinkState.error,
+          message: '当前平台不支持蓝牙接收。',
+        );
 
-  Future<BluetoothSinkStatus> getBluetoothSinkStatus() async {
-    if (!Platform.isWindows) {
-      return const BluetoothSinkStatus(
-        mode: 'unsupported',
-        message: '当前平台不支持蓝牙接收。',
-      );
-    }
-    return _status(
-      await _channel.invokeMethod<dynamic>('getBluetoothSinkStatus'),
-    );
-  }
+  Future<BluetoothSinkStatus> waitBluetoothSinkStatusChange() async =>
+      Platform.isWindows
+      ? _status(
+          await _channel.invokeMethod<dynamic>('waitBluetoothSinkStatusChange'),
+        )
+      : const BluetoothSinkStatus(
+          state: NativeSinkState.error,
+          message: '当前平台不支持蓝牙接收。',
+        );
 
   Future<void> openBluetoothSettings() async {
-    if (!Platform.isWindows && !Platform.isAndroid) return;
-    await _channel.invokeMethod<void>('openBluetoothSettings');
+    if (Platform.isWindows || Platform.isAndroid) {
+      await _channel.invokeMethod<void>('openBluetoothSettings');
+    }
   }
 
-  static BluetoothSinkStatus _status(dynamic value) {
-    if (value is Map<dynamic, dynamic>) {
-      return BluetoothSinkStatus.fromMap(value);
-    }
-    return const BluetoothSinkStatus(mode: 'unknown', message: '原生端返回了无效状态。');
-  }
+  static BluetoothSinkStatus _status(dynamic value) =>
+      value is Map<dynamic, dynamic>
+      ? BluetoothSinkStatus.fromMap(value)
+      : const BluetoothSinkStatus(
+          state: NativeSinkState.error,
+          message: '原生端返回了无效状态。',
+        );
 }

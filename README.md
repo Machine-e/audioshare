@@ -5,6 +5,11 @@ Windows acts as a classic Bluetooth A2DP Sink. Android uses normal system
 pairing and its media/audio-output selector; the Android app only opens
 Bluetooth settings.
 
+After startup, `waitingForRoute` means the receiver is ready but the phone has
+not selected this PC as media output. Only a real Windows `Opened` event becomes
+`opened`; a later close becomes `disconnected`. Changes are event-driven and
+cached across waiter reattachment rather than periodically polled.
+
 AudioShare does **not** use Tailscale, EasyTier, TCP/UDP streaming, Opus,
 Auracast, screen casting, MediaProjection, or Android audio capture.
 

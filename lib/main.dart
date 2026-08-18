@@ -1,140 +1,146 @@
 import 'dart:async';
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-
 import 'platform/external_route_bridge.dart';
 
 void main() => runApp(const AudioShareApp());
 
+enum SinkPhase {
+  stopped,
+  starting,
+  waitingForRoute,
+  opened,
+  stopping,
+  disconnected,
+  error,
+}
+
 class AudioShareController extends ChangeNotifier {
   AudioShareController({required this.bridge, required this.isWindows});
-
   final ExternalRouteBridge bridge;
   final bool isWindows;
   List<BluetoothDeviceInfo> devices = const [];
   String? selectedDeviceId;
-  bool loading = false;
-  bool starting = false;
-  bool connected = false;
-  String message = '';
-  Timer? _statusTimer;
-  bool _polling = false;
+  SinkPhase phase = SinkPhase.stopped;
+  bool loadingDevices = false;
+  String detail = '';
+  String deviceError = '';
+  int _sessionEpoch = 0;
+  int _deviceEpoch = 0;
   bool _disposed = false;
-  int _operation = 0;
 
   Future<void> refreshDevices() async {
-    if (!isWindows || loading || _disposed) return;
-    final operation = ++_operation;
-    loading = true;
+    if (!isWindows || loadingDevices || _disposed) return;
+    final epoch = ++_deviceEpoch;
+    loadingDevices = true;
     _notify();
     try {
-      final result = await bridge.listBluetoothDevices();
-      if (_disposed || operation != _operation) return;
-      final previous = selectedDeviceId;
-      devices = result;
-      selectedDeviceId = result.any((device) => device.id == previous)
-          ? previous
-          : (result.length == 1 ? result.first.id : null);
-      message = '';
-    } catch (error) {
-      if (!_disposed && operation == _operation) {
-        message = '刷新失败：$error';
+      final found = await bridge.listBluetoothDevices();
+      if (_disposed || epoch != _deviceEpoch) return;
+      devices = found;
+      deviceError = '';
+      selectedDeviceId = found.any((d) => d.id == selectedDeviceId)
+          ? selectedDeviceId
+          : (found.length == 1 ? found.first.id : null);
+    } catch (e) {
+      if (!_disposed && epoch == _deviceEpoch) {
+        deviceError = '刷新失败：$e';
       }
     } finally {
-      if (!_disposed && operation == _operation) {
-        loading = false;
+      if (!_disposed && epoch == _deviceEpoch) {
+        loadingDevices = false;
         _notify();
       }
     }
   }
 
   void selectDevice(String? id) {
-    if (_disposed || selectedDeviceId == id) return;
     selectedDeviceId = id;
     _notify();
   }
 
   Future<void> start() async {
     final id = selectedDeviceId;
-    if (!isWindows || id == null || loading || _disposed) return;
-    final operation = ++_operation;
-    loading = true;
-    starting = true;
+    if (!isWindows || id == null || _disposed || loadingDevices) return;
+    _deviceEpoch++;
+    loadingDevices = false;
+    final epoch = ++_sessionEpoch;
+    phase = SinkPhase.starting;
+    detail = '';
     _notify();
     try {
       final status = await bridge.startBluetoothSink(deviceId: id);
-      if (_disposed || operation != _operation) return;
-      connected = status.isConnected;
-      message = connected
-          ? '接收已启动。请在手机的媒体或音频输出选择器中选择此电脑。'
-          : status.message;
-      if (connected) _beginPolling();
-    } catch (error) {
-      if (!_disposed && operation == _operation) {
-        connected = false;
-        message = '启动失败：$error';
-      }
-    } finally {
-      if (!_disposed && operation == _operation) {
-        loading = false;
-        starting = false;
+      if (_disposed || epoch != _sessionEpoch) return;
+      _apply(status);
+      if (!_terminal(phase)) unawaited(_watch(epoch));
+    } catch (e) {
+      if (!_disposed && epoch == _sessionEpoch) {
+        phase = SinkPhase.error;
+        detail = '启动失败：$e';
         _notify();
+      }
+    }
+  }
+
+  Future<void> _watch(int epoch) async {
+    while (!_disposed && epoch == _sessionEpoch && !_terminal(phase)) {
+      try {
+        final status = await bridge.waitBluetoothSinkStatusChange();
+        if (_disposed || epoch != _sessionEpoch) return;
+        _apply(status);
+      } catch (e) {
+        if (!_disposed && epoch == _sessionEpoch) {
+          phase = SinkPhase.error;
+          detail = '$e';
+          _notify();
+        }
+        return;
       }
     }
   }
 
   Future<void> stop() async {
     if (_disposed) return;
-    final operation = ++_operation;
-    _statusTimer?.cancel();
-    _statusTimer = null;
-    loading = false;
-    starting = false;
-    connected = false;
-    message = '正在停止蓝牙接收…';
+    final epoch = ++_sessionEpoch;
+    _deviceEpoch++;
+    loadingDevices = false;
+    phase = SinkPhase.stopping;
     _notify();
     try {
       final status = await bridge.stopBluetoothSink();
-      if (_disposed || operation != _operation) return;
-      message = status.message.isEmpty ? '已停止蓝牙接收。' : status.message;
-    } catch (error) {
-      if (_disposed || operation != _operation) return;
-      message = '停止失败：$error';
+      if (!_disposed && epoch == _sessionEpoch) _apply(status);
+    } catch (e) {
+      if (!_disposed && epoch == _sessionEpoch) {
+        phase = SinkPhase.error;
+        detail = '停止失败：$e';
+        _notify();
+      }
+    }
+  }
+
+  void _apply(BluetoothSinkStatus status) {
+    phase = switch (status.state) {
+      NativeSinkState.stopped => SinkPhase.stopped,
+      NativeSinkState.waitingForRoute => SinkPhase.waitingForRoute,
+      NativeSinkState.opened => SinkPhase.opened,
+      NativeSinkState.disconnected => SinkPhase.disconnected,
+      NativeSinkState.error => SinkPhase.error,
+    };
+    detail = status.message;
+    if (_terminal(phase)) {
+      _sessionEpoch++;
+      _deviceEpoch++;
+      loadingDevices = false;
     }
     _notify();
   }
 
+  bool _terminal(SinkPhase value) => {
+    SinkPhase.stopped,
+    SinkPhase.disconnected,
+    SinkPhase.error,
+  }.contains(value);
   Future<void> openBluetoothSettings() => bridge.openBluetoothSettings();
-
-  void _beginPolling() {
-    if (_disposed) return;
-    _statusTimer?.cancel();
-    _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) => _poll());
-  }
-
-  Future<void> _poll() async {
-    if (_disposed || !connected || _polling) return;
-    _polling = true;
-    try {
-      final status = await bridge.getBluetoothSinkStatus();
-      if (_disposed) return;
-      if (!status.isConnected) {
-        _statusTimer?.cancel();
-        _statusTimer = null;
-        connected = false;
-        message =
-            '蓝牙连接已断开。请确认手机仍已配对，在 Windows 重新启动接收，'
-            '再从手机的媒体或音频输出选择器中选择此电脑。';
-        _notify();
-      }
-    } catch (_) {
-      // A transient status query should not tear down a working native sink.
-    } finally {
-      _polling = false;
-    }
-  }
-
   void _notify() {
     if (!_disposed) notifyListeners();
   }
@@ -142,33 +148,40 @@ class AudioShareController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
-    _operation++;
-    _statusTimer?.cancel();
+    _sessionEpoch++;
+    _deviceEpoch++;
     super.dispose();
   }
 }
 
 class AudioShareApp extends StatelessWidget {
   const AudioShareApp({super.key, this.bridge, this.platform});
-
   final ExternalRouteBridge? bridge;
   final TargetPlatform? platform;
-
   @override
   Widget build(BuildContext context) {
-    final currentPlatform = platform ?? defaultTargetPlatform;
+    final current = platform ?? defaultTargetPlatform;
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'AudioShare',
+      themeMode: ThemeMode.system,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xff315bd6)),
-        useMaterial3: true,
         fontFamily: 'Geist Sans',
+        useMaterial3: true,
+      ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xff8ca7ff),
+          brightness: Brightness.dark,
+        ),
+        fontFamily: 'Geist Sans',
+        useMaterial3: true,
       ),
       home: HomeScreen(
         bridge: bridge ?? ExternalRouteBridge(),
-        isWindows: currentPlatform == TargetPlatform.windows,
-        isAndroid: currentPlatform == TargetPlatform.android,
+        isWindows: current == TargetPlatform.windows,
+        isAndroid: current == TargetPlatform.android,
       ),
     );
   }
@@ -181,18 +194,15 @@ class HomeScreen extends StatefulWidget {
     required this.isWindows,
     required this.isAndroid,
   });
-
   final ExternalRouteBridge bridge;
   final bool isWindows;
   final bool isAndroid;
-
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> {
   late final AudioShareController controller;
-
   @override
   void initState() {
     super.initState();
@@ -210,148 +220,187 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('AudioShare · 蓝牙音频接收')),
-      body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 720),
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: widget.isWindows
-                  ? _WindowsContent(controller: controller)
-                  : widget.isAndroid
-                  ? _AndroidContent(bridge: widget.bridge)
-                  : const _UnsupportedContent(),
-            ),
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('AudioShare')),
+    body: SafeArea(
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 720),
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: widget.isWindows
+                ? _WindowsContent(controller)
+                : widget.isAndroid
+                ? _AndroidContent(widget.bridge)
+                : const Text('当前平台不支持。'),
           ),
         ),
       ),
-    );
-  }
+    ),
+  );
 }
 
 class _WindowsContent extends StatelessWidget {
-  const _WindowsContent({required this.controller});
+  const _WindowsContent(this.controller);
   final AudioShareController controller;
-
   @override
-  Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: controller,
-      builder: (context, _) => Column(
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: controller,
+    builder: (context, _) {
+      final active = {
+        SinkPhase.starting,
+        SinkPhase.waitingForRoute,
+        SinkPhase.opened,
+        SinkPhase.stopping,
+      }.contains(controller.phase);
+      final status = switch (controller.phase) {
+        SinkPhase.stopped => ('尚未启动接收', '选择已配对的手机，然后启动接收。'),
+        SinkPhase.starting => ('正在启动接收', '正在启用 Windows 蓝牙音频接收器。'),
+        SinkPhase.waitingForRoute => ('等待手机选择此电脑', '在手机的媒体输出或播放设备中选择此电脑。'),
+        SinkPhase.opened => ('手机媒体路由已连接', '手机已将媒体路由连接到此电脑。'),
+        SinkPhase.stopping => ('正在停止', '正在关闭蓝牙音频接收器。'),
+        SinkPhase.disconnected => ('连接已断开', '请确认配对和媒体音频设置，然后重新启动。'),
+        SinkPhase.error => (
+          '出现错误',
+          controller.detail.isEmpty ? '请重试。' : controller.detail,
+        ),
+      };
+      return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Text(
-            'Bluetooth A2DP Sink',
+            '让手机音频在这台电脑上播放',
             style: Theme.of(context).textTheme.headlineMedium,
           ),
+          const SizedBox(height: 20),
+          Text('选择手机', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
-          const Text('从支持经典蓝牙 A2DP 的 Android 手机接收媒体音频。无需局域网、采集或额外传输。'),
-          const SizedBox(height: 24),
-          if (controller.devices.isEmpty && !controller.loading)
-            const Text('未找到可用手机。请先完成系统蓝牙配对，并确认手机已为此电脑启用“媒体音频”，再刷新。')
-          else
+          if (controller.loadingDevices) ...[
+            const LinearProgressIndicator(),
+            const SizedBox(height: 8),
+          ] else if (controller.devices.isEmpty) ...[
+            const Text('未找到已配对手机。请先配对，并在手机上为此电脑启用“媒体音频”。'),
+            const SizedBox(height: 8),
+          ] else
             DropdownButtonFormField<String>(
               key: const Key('device-dropdown'),
               initialValue: controller.selectedDeviceId,
+              isExpanded: true,
               decoration: const InputDecoration(
-                labelText: '已配对的 A2DP 手机',
                 border: OutlineInputBorder(),
+                labelText: '已配对的手机',
               ),
               items: controller.devices
                   .map(
-                    (device) => DropdownMenuItem(
-                      value: device.id,
-                      child: Text(device.name),
+                    (d) => DropdownMenuItem(
+                      value: d.id,
+                      child: Text(d.name, overflow: TextOverflow.ellipsis),
                     ),
                   )
                   .toList(),
-              onChanged: controller.connected ? null : controller.selectDevice,
+              onChanged: active ? null : controller.selectDevice,
             ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 12),
           Wrap(
-            spacing: 12,
-            runSpacing: 12,
+            spacing: 8,
+            runSpacing: 8,
             children: [
               OutlinedButton.icon(
-                onPressed: controller.loading
+                onPressed: controller.loadingDevices
                     ? null
                     : controller.refreshDevices,
                 icon: const Icon(Icons.refresh),
                 label: const Text('刷新设备'),
               ),
               OutlinedButton.icon(
+                key: const Key('windows-settings'),
                 onPressed: controller.openBluetoothSettings,
                 icon: const Icon(Icons.settings_bluetooth),
                 label: const Text('打开 Windows 蓝牙设置'),
               ),
-              if (controller.connected || controller.starting)
-                FilledButton.icon(
-                  key: const Key('stop-button'),
-                  onPressed: controller.stop,
-                  icon: const Icon(Icons.stop),
-                  label: Text(controller.starting ? '取消启动' : '停止接收'),
-                )
-              else
-                FilledButton.icon(
-                  key: const Key('start-button'),
-                  onPressed:
-                      controller.selectedDeviceId == null || controller.loading
-                      ? null
-                      : controller.start,
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text('启动接收'),
-                ),
             ],
           ),
-          if (controller.loading) ...[
-            const SizedBox(height: 20),
-            const LinearProgressIndicator(),
+          if (controller.deviceError.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(controller.deviceError),
           ],
-          if (controller.message.isNotEmpty) ...[
-            const SizedBox(height: 20),
-            Text(controller.message, key: const Key('status-message')),
-          ],
-          if (controller.connected) ...[
-            const SizedBox(height: 12),
-            const Text('已连接。请在手机的媒体输出、音频输出或播放设备中选择此电脑并播放。'),
-          ],
+          const SizedBox(height: 20),
+          Semantics(
+            key: const Key('status-semantics'),
+            liveRegion: true,
+            excludeSemantics: true,
+            label: '${status.$1}。${status.$2}',
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      status.$1,
+                      key: const Key('status-title'),
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 6),
+                    Text(status.$2),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (active)
+            OutlinedButton.icon(
+              key: const Key('stop-button'),
+              onPressed: controller.phase == SinkPhase.stopping
+                  ? null
+                  : controller.stop,
+              icon: const Icon(Icons.stop),
+              label: Text(
+                controller.phase == SinkPhase.starting ? '取消启动' : '停止接收',
+              ),
+            )
+          else
+            FilledButton.icon(
+              key: const Key('start-button'),
+              onPressed:
+                  controller.selectedDeviceId == null ||
+                      controller.loadingDevices
+                  ? null
+                  : controller.start,
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('启动接收'),
+            ),
         ],
-      ),
-    );
-  }
+      );
+    },
+  );
 }
 
 class _AndroidContent extends StatelessWidget {
-  const _AndroidContent({required this.bridge});
+  const _AndroidContent(this.bridge);
   final ExternalRouteBridge bridge;
-
   @override
   Widget build(BuildContext context) => Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
-      Text('将电脑选为手机音频输出', style: Theme.of(context).textTheme.headlineMedium),
-      const SizedBox(height: 12),
-      const Text(
-        '本应用不采集或传输音频。请先与 Windows 电脑完成普通蓝牙配对，'
-        '并为此电脑启用“媒体音频”。播放媒体时，在系统的媒体输出、音频输出或播放设备中选择此电脑。'
-        '不同品牌的入口名称和位置可能不同。',
-      ),
+      Text('将电脑设为手机媒体输出', style: Theme.of(context).textTheme.headlineMedium),
+      const SizedBox(height: 16),
+      const Text('AudioShare 不采集或传输音频，连接与输出选择均由系统蓝牙完成。'),
+      const SizedBox(height: 16),
+      const Text('1. 与 Windows 电脑完成蓝牙配对。'),
+      const SizedBox(height: 10),
+      const Text('2. 为这台电脑启用“媒体音频”。'),
+      const SizedBox(height: 10),
+      const Text('3. 播放时在媒体输出中选择这台电脑。'),
       const SizedBox(height: 20),
       FilledButton.icon(
+        key: const Key('android-settings'),
         onPressed: bridge.openBluetoothSettings,
         icon: const Icon(Icons.settings_bluetooth),
         label: const Text('打开系统蓝牙设置'),
       ),
     ],
   );
-}
-
-class _UnsupportedContent extends StatelessWidget {
-  const _UnsupportedContent();
-  @override
-  Widget build(BuildContext context) =>
-      const Text('当前平台不支持。AudioShare 仅支持 Windows 接收端和 Android 引导。');
 }

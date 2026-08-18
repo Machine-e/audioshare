@@ -29,7 +29,12 @@ PowerShell 5.1 将 WinRT 对象暴露为 `System.__ComObject`，不能直接调�
 `AudioPlaybackConnection` 对象存活。蓝牙异步操作在后台执行，不阻塞窗口。
 
 当前 Bluetooth-only Windows 构建已再次从应用内验证：能枚举
-`Machine的Xiaomi 14`、连接返回 `Opened`，并且启动与状态轮询期间窗口保持响应。
+`Machine的Xiaomi 14`、连接返回 `Opened`，并且启动与状态事件等待期间窗口保持响应。
+
+`waitingForRoute` 表示 Windows 接收器已就绪，但仍需在手机媒体输出中选择此电脑；
+只有系统观察到真实 `Opened` 才表示媒体路由已连接，这不代表正在产生音频流量。
+状态事件会在 Flutter 重挂等待器的间隙缓存。自动化状态机和 Widget 测试不能替代
+真实手机、蓝牙适配器、驱动与 Windows 版本组合上的持续播放验证。
 
 ## 使用步骤
 

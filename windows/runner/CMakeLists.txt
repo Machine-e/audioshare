@@ -8,6 +8,7 @@ project(runner LANGUAGES CXX)
 # Any new source files that you add to the application should be added here.
 add_executable(${BINARY_NAME} WIN32
   "external_route_channel.cpp"
+  "sink_state_machine.cpp"
   "flutter_window.cpp"
   "main.cpp"
   "utils.cpp"
@@ -39,3 +40,9 @@ target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)
+
+add_executable(sink_state_machine_test EXCLUDE_FROM_ALL
+  "sink_state_machine.cpp"
+  "sink_state_machine_test.cpp"
+)
+target_compile_features(sink_state_machine_test PRIVATE cxx_std_17)
