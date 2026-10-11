@@ -1,26 +1,275 @@
 package com.machinee.audioshare
 
 import android.content.Intent
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var testTone: ToneGenerator? = null
+    private var releaseToneRunnable: Runnable? = null
+    private lateinit var companionController: CompanionController
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        companionController = CompanionController(this, flutterEngine.dartExecutor.binaryMessenger)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.machinee.audioshare/preferences")
+            .setMethodCallHandler { call, result ->
+                val preferences = getSharedPreferences("appearance", MODE_PRIVATE)
+                when (call.method) {
+                    "readThemeMode" -> result.success(preferences.getString("themeMode", "system"))
+                    "writeThemeMode" -> {
+                        val mode = call.argument<String>("mode")
+                        if (mode !in listOf("light", "dark", "system")) {
+                            result.error("invalid_theme", "Unknown appearance", null)
+                        } else {
+                            preferences.edit().putString("themeMode", mode).apply()
+                            result.success(null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
-                if (call.method == "openBluetoothSettings") {
-                    startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
-                    result.success(null)
-                } else {
-                    result.notImplemented()
+                try {
+                    when (call.method) {
+                        "openBluetoothSettings" -> {
+                            startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                            result.success(null)
+                        }
+                        // Compatibility channel names; never proxy application
+                        // gain requests to Android's global STREAM_MUSIC volume.
+                        "getMediaVolume" -> result.success(mapOf(
+                            "available" to false,
+                            "current" to 0,
+                            "max" to 0,
+                            "fixed" to true,
+                            "message" to "当前蓝牙模式暂不支持独立音量与增益。",
+                        ))
+                        "setMediaVolume" -> result.error(
+                            "independent_volume_unavailable",
+                            "当前蓝牙模式暂不支持独立音量与增益。",
+                            null,
+                        )
+                        "playTestTone" -> {
+                            playMediaTestTone()
+                            result.success(null)
+                        }
+                        "stopTestTone" -> {
+                            stopMediaTestTone()
+                            result.success(null)
+                        }
+                        else -> result.notImplemented()
+                    }
+                } catch (exception: Exception) {
+                    result.error(
+                        "android_error",
+                        exception.message ?: "Android operation failed",
+                        exception.javaClass.simpleName,
+                    )
+                }
+            }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, UPDATE_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "checkForUpdate" -> checkForUpdate(result)
+                    "downloadAndInstall" -> {
+                        val url = call.argument<String>("url")
+                        if (url.isNullOrBlank()) {
+                            result.error("invalid_argument", "update URL is required", null)
+                        } else {
+                            downloadAndInstall(url, result)
+                        }
+                    }
+                    else -> result.notImplemented()
                 }
             }
     }
 
+    override fun onStop() {
+        stopMediaTestTone()
+        if (::companionController.isInitialized) companionController.onStop()
+        super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::companionController.isInitialized) companionController.onResume()
+    }
+
+    override fun onDestroy() {
+        if (::companionController.isInitialized) companionController.destroy()
+        super.onDestroy()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (::companionController.isInitialized) companionController.handleIntent(intent)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (::companionController.isInitialized) companionController.onRequestPermissionsResult(requestCode)
+    }
+
+    private fun playMediaTestTone() {
+        stopMediaTestTone()
+
+        // ToneGenerator is used only as a short test signal routed on the media stream;
+        // this is not a voice-call tone and does not use the call audio stream.
+        val tone = ToneGenerator(AudioManager.STREAM_MUSIC, TEST_TONE_VOLUME_PERCENT)
+        if (!tone.startTone(ToneGenerator.TONE_DTMF_0, TEST_TONE_DURATION_MS)) {
+            tone.release()
+            throw IllegalStateException("Unable to start media test tone")
+        }
+        testTone = tone
+        releaseToneRunnable = Runnable { stopMediaTestTone() }.also {
+            mainHandler.postDelayed(it, TEST_TONE_DURATION_MS.toLong())
+        }
+    }
+
+    private fun stopMediaTestTone() {
+        releaseToneRunnable?.let(mainHandler::removeCallbacks)
+        releaseToneRunnable = null
+        testTone?.run {
+            stopTone()
+            release()
+        }
+        testTone = null
+    }
+
+    private fun checkForUpdate(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val connection = URL(LATEST_RELEASE_URL).openConnection() as HttpURLConnection
+                connection.connectTimeout = NETWORK_TIMEOUT_MS
+                connection.readTimeout = NETWORK_TIMEOUT_MS
+                connection.requestMethod = "GET"
+                connection.setRequestProperty("Accept", "application/vnd.github+json")
+                connection.setRequestProperty("User-Agent", "AudioShare/${currentVersionName()}")
+                try {
+                    if (connection.responseCode !in 200..299) {
+                        throw IllegalStateException("更新服务器返回 HTTP ${connection.responseCode}")
+                    }
+                    val release = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
+                    val latestVersion = release.getString("tag_name").removePrefix("v")
+                    val assets = release.getJSONArray("assets")
+                    var downloadUrl = ""
+                    for (index in 0 until assets.length()) {
+                        val asset = assets.getJSONObject(index)
+                        if (asset.optString("name") == APK_ASSET_NAME) {
+                            downloadUrl = asset.optString("browser_download_url")
+                            break
+                        }
+                    }
+                    if (downloadUrl.isBlank()) {
+                        throw IllegalStateException("最新版本没有找到 $APK_ASSET_NAME")
+                    }
+                    val currentVersion = currentVersionName()
+                    val available = compareVersions(latestVersion, currentVersion) > 0
+                    mainHandler.post {
+                        result.success(
+                            mapOf(
+                                "available" to available,
+                                "currentVersion" to currentVersion,
+                                "latestVersion" to latestVersion,
+                                "downloadUrl" to downloadUrl,
+                            ),
+                        )
+                    }
+                } finally {
+                    connection.disconnect()
+                }
+            } catch (exception: Exception) {
+                mainHandler.post {
+                    result.error(
+                        "update_check_failed",
+                        exception.message ?: "检查更新失败",
+                        exception.javaClass.simpleName,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    private fun downloadAndInstall(url: String, result: MethodChannel.Result) {
+        Thread {
+            try {
+                val updateDirectory = File(cacheDir, "updates").apply { mkdirs() }
+                val apk = File(updateDirectory, APK_ASSET_NAME)
+                val connection = URL(url).openConnection() as HttpURLConnection
+                connection.connectTimeout = NETWORK_TIMEOUT_MS
+                connection.readTimeout = NETWORK_TIMEOUT_MS
+                connection.requestMethod = "GET"
+                connection.setRequestProperty("User-Agent", "AudioShare/${currentVersionName()}")
+                try {
+                    if (connection.responseCode !in 200..299) {
+                        throw IllegalStateException("APK 下载失败：HTTP ${connection.responseCode}")
+                    }
+                    connection.inputStream.use { input ->
+                        apk.outputStream().use { output -> input.copyTo(output) }
+                    }
+                } finally {
+                    connection.disconnect()
+                }
+                val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                mainHandler.post {
+                    startActivity(intent)
+                    result.success(null)
+                }
+            } catch (exception: Exception) {
+                mainHandler.post {
+                    result.error(
+                        "update_install_failed",
+                        exception.message ?: "下载或安装更新失败",
+                        exception.javaClass.simpleName,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    private fun compareVersions(left: String, right: String): Int {
+        val leftParts = left.split('.').map { it.toIntOrNull() ?: 0 }
+        val rightParts = right.split('.').map { it.toIntOrNull() ?: 0 }
+        for (index in 0 until maxOf(leftParts.size, rightParts.size)) {
+            val comparison = (leftParts.getOrElse(index) { 0 }).compareTo(rightParts.getOrElse(index) { 0 })
+            if (comparison != 0) return comparison
+        }
+        return 0
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentVersionName(): String =
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "0.0.0"
+
     companion object {
         private const val CHANNEL = "com.machinee.audioshare/external_route"
+        private const val UPDATE_CHANNEL = "com.machinee.audioshare/update"
+        private const val LATEST_RELEASE_URL =
+            "https://api.github.com/repos/Machine-e/audioshare/releases/latest"
+        private const val APK_ASSET_NAME = "AudioShare-Android.apk"
+        private const val NETWORK_TIMEOUT_MS = 15_000
+        private const val TEST_TONE_VOLUME_PERCENT = 20
+        private const val TEST_TONE_DURATION_MS = 2500
     }
 }

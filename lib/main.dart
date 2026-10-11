@@ -1,9 +1,13 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'android_screen.dart';
+import 'app_style.dart';
+import 'platform/android_update_bridge.dart';
+import 'platform/companion_bridge.dart';
 import 'platform/external_route_bridge.dart';
 
-void main() => runApp(const AudioShareApp());
+void main() => runApp(const AudioShareApp(enableUpdateChecks: true));
 
 enum SinkPhase {
   stopped,
@@ -20,28 +24,51 @@ class AudioShareController extends ChangeNotifier {
   final ExternalRouteBridge bridge;
   final bool isWindows;
   List<BluetoothDeviceInfo> devices = const [];
-  String? selectedDeviceId;
+  String? preferredDeviceId;
+  String? get selectedDeviceId =>
+      devices.any((d) => d.id == preferredDeviceId) ? preferredDeviceId : null;
   SinkPhase phase = SinkPhase.stopped;
   bool loadingDevices = false;
+  int deviceRefreshRequests = 0;
+  int deviceRefreshResults = 0;
   String detail = '';
   String deviceError = '';
   int _sessionEpoch = 0;
   int _deviceEpoch = 0;
   bool _disposed = false;
+  bool _preferenceLoaded = false;
+  bool _userSelected = false;
+  Future<void> _preferenceWrites = Future.value();
+
+  Future<void> initialize() async {
+    if (!isWindows || _preferenceLoaded || _disposed) return;
+    _preferenceLoaded = true;
+    final preference = () async {
+      try {
+        final cached = await bridge.readPreferredDevice();
+        if (!_disposed && !_userSelected) {
+          preferredDeviceId = cached;
+          _notify();
+        }
+      } catch (_) {
+        // Preferences are a convenience and must never block Bluetooth controls.
+      }
+    }();
+    await Future.wait([preference, refreshDevices()]);
+  }
 
   Future<void> refreshDevices() async {
     if (!isWindows || loadingDevices || _disposed) return;
     final epoch = ++_deviceEpoch;
+    deviceRefreshRequests++;
     loadingDevices = true;
     _notify();
     try {
       final found = await bridge.listBluetoothDevices();
       if (_disposed || epoch != _deviceEpoch) return;
       devices = found;
+      deviceRefreshResults++;
       deviceError = '';
-      selectedDeviceId = found.any((d) => d.id == selectedDeviceId)
-          ? selectedDeviceId
-          : (found.length == 1 ? found.first.id : null);
     } catch (e) {
       if (!_disposed && epoch == _deviceEpoch) {
         deviceError = '刷新失败：$e';
@@ -55,13 +82,24 @@ class AudioShareController extends ChangeNotifier {
   }
 
   void selectDevice(String? id) {
-    selectedDeviceId = id;
+    if (_disposed || id == null || _active) return;
+    _userSelected = true;
+    preferredDeviceId = id;
     _notify();
+    _preferenceWrites = _preferenceWrites.then((_) async {
+      try {
+        await bridge.writePreferredDevice(id);
+      } catch (_) {
+        // A failed cache write must not undo an explicit user selection.
+      }
+    });
   }
 
   Future<void> start() async {
     final id = selectedDeviceId;
-    if (!isWindows || id == null || _disposed || loadingDevices) return;
+    if (!isWindows || id == null || _disposed || loadingDevices || _active) {
+      return;
+    }
     _deviceEpoch++;
     loadingDevices = false;
     final epoch = ++_sessionEpoch;
@@ -140,7 +178,24 @@ class AudioShareController extends ChangeNotifier {
     SinkPhase.disconnected,
     SinkPhase.error,
   }.contains(value);
-  Future<void> openBluetoothSettings() => bridge.openBluetoothSettings();
+  bool get _active => {
+    SinkPhase.starting,
+    SinkPhase.waitingForRoute,
+    SinkPhase.opened,
+    SinkPhase.stopping,
+  }.contains(phase);
+  Future<void> openBluetoothSettings() async {
+    if (_disposed) return;
+    try {
+      await bridge.openBluetoothSettings();
+    } catch (e) {
+      if (!_disposed) {
+        deviceError = '无法打开蓝牙设置：$e';
+        _notify();
+      }
+    }
+  }
+
   void _notify() {
     if (!_disposed) notifyListeners();
   }
@@ -154,34 +209,88 @@ class AudioShareController extends ChangeNotifier {
   }
 }
 
-class AudioShareApp extends StatelessWidget {
-  const AudioShareApp({super.key, this.bridge, this.platform});
+class AudioShareApp extends StatefulWidget {
+  const AudioShareApp({
+    super.key,
+    this.bridge,
+    this.companionBridge,
+    this.platform,
+    this.enableUpdateChecks = false,
+  });
   final ExternalRouteBridge? bridge;
+  final CompanionBridge? companionBridge;
   final TargetPlatform? platform;
+  final bool enableUpdateChecks;
+  @override
+  State<AudioShareApp> createState() => _AudioShareAppState();
+}
+
+class _AudioShareAppState extends State<AudioShareApp> {
+  ThemeMode mode = ThemeMode.system;
+  late final ExternalRouteBridge bridge =
+      widget.bridge ?? ExternalRouteBridge();
+  late final CompanionBridge companion =
+      widget.companionBridge ?? CompanionBridge();
+  bool selectedTheme = false;
+  Future<void> themeWrites = Future.value();
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadTheme());
+  }
+
+  Future<void> _loadTheme() async {
+    try {
+      final saved = await bridge.readThemeMode();
+      if (mounted && !selectedTheme) {
+        setState(
+          () => mode = ThemeMode.values.firstWhere(
+            (value) => value.name == saved,
+            orElse: () => ThemeMode.system,
+          ),
+        );
+      }
+    } catch (_) {
+      /* Use the system appearance if preferences are unavailable. */
+    }
+  }
+
+  void _setTheme(ThemeMode value) {
+    selectedTheme = true;
+    setState(() => mode = value);
+    themeWrites = themeWrites.then((_) async {
+      try {
+        await bridge.writeThemeMode(value.name);
+      } catch (_) {}
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
-    final current = platform ?? defaultTargetPlatform;
+    final current = widget.platform ?? defaultTargetPlatform;
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'AudioShare',
-      themeMode: ThemeMode.system,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xff315bd6)),
-        fontFamily: 'Geist Sans',
-        useMaterial3: true,
-      ),
-      darkTheme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xff8ca7ff),
-          brightness: Brightness.dark,
-        ),
-        fontFamily: 'Geist Sans',
-        useMaterial3: true,
-      ),
+      themeMode: mode,
+      themeAnimationDuration:
+          WidgetsBinding
+              .instance
+              .platformDispatcher
+              .accessibilityFeatures
+              .disableAnimations
+          ? Duration.zero
+          : const Duration(milliseconds: 280),
+      theme: audioShareTheme(Brightness.light),
+      darkTheme: audioShareTheme(Brightness.dark),
       home: HomeScreen(
-        bridge: bridge ?? ExternalRouteBridge(),
+        bridge: bridge,
+        companionBridge: companion,
         isWindows: current == TargetPlatform.windows,
         isAndroid: current == TargetPlatform.android,
+        enableUpdateChecks: widget.enableUpdateChecks,
+        themeMode: mode,
+        onThemeChanged: _setTheme,
       ),
     );
   }
@@ -191,12 +300,20 @@ class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
     required this.bridge,
+    required this.companionBridge,
     required this.isWindows,
     required this.isAndroid,
+    required this.enableUpdateChecks,
+    required this.themeMode,
+    required this.onThemeChanged,
   });
   final ExternalRouteBridge bridge;
+  final CompanionBridge companionBridge;
   final bool isWindows;
   final bool isAndroid;
+  final bool enableUpdateChecks;
+  final ThemeMode themeMode;
+  final ValueChanged<ThemeMode> onThemeChanged;
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
@@ -210,7 +327,7 @@ class _HomeScreenState extends State<HomeScreen> {
       bridge: widget.bridge,
       isWindows: widget.isWindows,
     );
-    if (widget.isWindows) unawaited(controller.refreshDevices());
+    if (widget.isWindows) unawaited(controller.initialize());
   }
 
   @override
@@ -220,20 +337,58 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('AudioShare')),
-    body: SafeArea(
-      child: Align(
-        alignment: Alignment.topCenter,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 720),
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(20),
-            child: widget.isWindows
-                ? _WindowsContent(controller)
-                : widget.isAndroid
-                ? _AndroidContent(widget.bridge)
-                : const Text('当前平台不支持。'),
+  Widget build(BuildContext context) => AmbientBackground(
+    child: Scaffold(
+      appBar: AppBar(
+        title: const Text('AudioShare'),
+        actions: [
+          PopupMenuButton<ThemeMode>(
+            key: const Key('theme-menu'),
+            tooltip: '外观',
+            initialValue: widget.themeMode,
+            onSelected: widget.onThemeChanged,
+            icon: Icon(
+              Theme.of(context).brightness == Brightness.dark
+                  ? Icons.dark_mode_outlined
+                  : Icons.light_mode_outlined,
+            ),
+            itemBuilder: (_) => [
+              for (final option in [
+                (ThemeMode.light, '亮色'),
+                (ThemeMode.dark, '暗色'),
+                (ThemeMode.system, '跟随系统'),
+              ])
+                CheckedPopupMenuItem(
+                  value: option.$1,
+                  checked: widget.themeMode == option.$1,
+                  child: Text(option.$2),
+                ),
+            ],
+          ),
+          const SizedBox(width: 16),
+        ],
+      ),
+      body: SafeArea(
+        child: Align(
+          alignment: Alignment.topCenter,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: widget.isWindows ? 1040 : 560,
+            ),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(24, 12, 24, 32),
+              child: widget.isWindows
+                  ? _WindowsContent(controller)
+                  : widget.isAndroid
+                  ? AndroidScreen(
+                      routeBridge: widget.bridge,
+                      companionBridge: widget.companionBridge,
+                      updateBridge: widget.enableUpdateChecks
+                          ? AndroidUpdateBridge()
+                          : null,
+                    )
+                  : const Text('当前平台不支持。'),
+            ),
           ),
         ),
       ),
@@ -270,137 +425,296 @@ class _WindowsContent extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Text(
-            '让手机音频在这台电脑上播放',
-            style: Theme.of(context).textTheme.headlineMedium,
-          ),
-          const SizedBox(height: 20),
-          Text('选择手机', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
-          if (controller.loadingDevices) ...[
-            const LinearProgressIndicator(),
-            const SizedBox(height: 8),
-          ] else if (controller.devices.isEmpty) ...[
-            const Text('未找到已配对手机。请先配对，并在手机上为此电脑启用“媒体音频”。'),
-            const SizedBox(height: 8),
-          ] else
-            DropdownButtonFormField<String>(
-              key: const Key('device-dropdown'),
-              initialValue: controller.selectedDeviceId,
-              isExpanded: true,
-              decoration: const InputDecoration(
-                border: OutlineInputBorder(),
-                labelText: '已配对的手机',
-              ),
-              items: controller.devices
-                  .map(
-                    (d) => DropdownMenuItem(
-                      value: d.id,
-                      child: Text(d.name, overflow: TextOverflow.ellipsis),
-                    ),
-                  )
-                  .toList(),
-              onChanged: active ? null : controller.selectDevice,
+            '让声音，在这里继续。',
+            style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+              fontWeight: FontWeight.w600,
+              letterSpacing: -1,
             ),
-          const SizedBox(height: 12),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '从手机，到电脑。',
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 16),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final hero = Semantics(
+                key: const Key('status-semantics'),
+                liveRegion: true,
+                excludeSemantics: true,
+                label: '${status.$1}。${status.$2}',
+                child: GlassSurface(
+                  child: Padding(
+                    padding: const EdgeInsets.all(28),
+                    child: Column(
+                      children: [
+                        AudioHalo(
+                          active: controller.phase == SinkPhase.opened,
+                          icon: controller.phase == SinkPhase.opened
+                              ? Icons.bluetooth_connected
+                              : Icons.headphones_rounded,
+                        ),
+                        const SizedBox(height: 20),
+                        AnimatedSwitcher(
+                          duration: motionDuration(context),
+                          layoutBuilder: (current, previous) =>
+                              current ?? const SizedBox.shrink(),
+                          child: Text(
+                            status.$1,
+                            key: ValueKey(status.$1),
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(status.$2, textAlign: TextAlign.center),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+              final controls = GlassSurface(
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        '选择设备',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 12),
+                      if (controller.loadingDevices) ...[
+                        const LinearProgressIndicator(),
+                        const SizedBox(height: 8),
+                      ] else if (controller.devices.isEmpty) ...[
+                        const Text('未找到已配对手机。请先配对，并在手机上为此电脑启用“媒体音频”。'),
+                        const SizedBox(height: 8),
+                      ] else
+                        DropdownButton<String>(
+                          key: const Key('device-dropdown'),
+                          value: controller.selectedDeviceId,
+                          isExpanded: true,
+                          hint: const Text('选择已配对的手机'),
+                          items: controller.devices
+                              .map(
+                                (d) => DropdownMenuItem(
+                                  value: d.id,
+                                  child: Text(
+                                    d.name,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: active ? null : controller.selectDevice,
+                        ),
+                      if (controller.preferredDeviceId != null &&
+                          controller.selectedDeviceId == null &&
+                          controller.devices.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        const Text('上次选择的设备当前不可用，请重新选择。'),
+                      ],
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: controller.loadingDevices
+                                ? null
+                                : controller.refreshDevices,
+                            icon: AnimatedRotation(
+                              turns: controller.deviceRefreshRequests
+                                  .toDouble(),
+                              duration: MediaQuery.disableAnimationsOf(context)
+                                  ? Duration.zero
+                                  : const Duration(milliseconds: 650),
+                              curve: Curves.easeInOutCubic,
+                              child: const Icon(Icons.refresh),
+                            ),
+                            label: const Text('刷新设备'),
+                          ),
+                          OutlinedButton.icon(
+                            key: const Key('windows-settings'),
+                            onPressed: controller.openBluetoothSettings,
+                            icon: const Icon(Icons.settings_bluetooth),
+                            label: const Text('打开 Windows 蓝牙设置'),
+                          ),
+                        ],
+                      ),
+                      if (controller.deviceError.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text(controller.deviceError),
+                      ],
+                      if (!controller.loadingDevices &&
+                          controller.deviceError.isEmpty &&
+                          controller.deviceRefreshResults > 0)
+                        Text(
+                          '已刷新设备列表 · ${controller.devices.length} 台 · 第 ${controller.deviceRefreshResults} 次',
+                        ),
+                      const SizedBox(height: 12),
+                      if (active)
+                        OutlinedButton.icon(
+                          key: const Key('stop-button'),
+                          onPressed: controller.phase == SinkPhase.stopping
+                              ? null
+                              : controller.stop,
+                          icon: const Icon(Icons.stop),
+                          label: Text(
+                            controller.phase == SinkPhase.starting
+                                ? '取消启动'
+                                : '停止接收',
+                          ),
+                        )
+                      else
+                        FilledButton.icon(
+                          key: const Key('start-button'),
+                          onPressed:
+                              controller.selectedDeviceId == null ||
+                                  controller.loadingDevices
+                              ? null
+                              : controller.start,
+                          icon: const Icon(Icons.play_arrow),
+                          label: Text(
+                            controller.phase == SinkPhase.disconnected ||
+                                    controller.phase == SinkPhase.error
+                                ? '手动重试'
+                                : '启动接收',
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              );
+              if (constraints.maxWidth >= 640 &&
+                  MediaQuery.textScalerOf(context).scale(14) < 20) {
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(child: hero),
+                    const SizedBox(width: 20),
+                    Expanded(child: controls),
+                  ],
+                );
+              }
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [hero, const SizedBox(height: 20), controls],
+              );
+            },
+          ),
+          const SizedBox(height: 16),
+          _StatusServiceCard(controller.bridge),
+          const SizedBox(height: 16),
+          const ExpansionTile(
+            title: Text('使用帮助'),
             children: [
-              OutlinedButton.icon(
-                onPressed: controller.loadingDevices
-                    ? null
-                    : controller.refreshDevices,
-                icon: const Icon(Icons.refresh),
-                label: const Text('刷新设备'),
-              ),
-              OutlinedButton.icon(
-                key: const Key('windows-settings'),
-                onPressed: controller.openBluetoothSettings,
-                icon: const Icon(Icons.settings_bluetooth),
-                label: const Text('打开 Windows 蓝牙设置'),
+              Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('关闭窗口时可按提示保留托盘接收。遇到问题请检查 Windows 蓝牙设置和配对状态。'),
               ),
             ],
           ),
-          if (controller.deviceError.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            Text(controller.deviceError),
-          ],
-          const SizedBox(height: 20),
-          Semantics(
-            key: const Key('status-semantics'),
-            liveRegion: true,
-            excludeSemantics: true,
-            label: '${status.$1}。${status.$2}',
-            child: Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      status.$1,
-                      key: const Key('status-title'),
-                      style: Theme.of(context).textTheme.titleLarge,
-                    ),
-                    const SizedBox(height: 6),
-                    Text(status.$2),
-                  ],
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          if (active)
-            OutlinedButton.icon(
-              key: const Key('stop-button'),
-              onPressed: controller.phase == SinkPhase.stopping
-                  ? null
-                  : controller.stop,
-              icon: const Icon(Icons.stop),
-              label: Text(
-                controller.phase == SinkPhase.starting ? '取消启动' : '停止接收',
-              ),
-            )
-          else
-            FilledButton.icon(
-              key: const Key('start-button'),
-              onPressed:
-                  controller.selectedDeviceId == null ||
-                      controller.loadingDevices
-                  ? null
-                  : controller.start,
-              icon: const Icon(Icons.play_arrow),
-              label: const Text('启动接收'),
-            ),
         ],
       );
     },
   );
 }
 
-class _AndroidContent extends StatelessWidget {
-  const _AndroidContent(this.bridge);
+class _StatusServiceCard extends StatefulWidget {
+  const _StatusServiceCard(this.bridge);
   final ExternalRouteBridge bridge;
   @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.stretch,
-    children: [
-      Text('将电脑设为手机媒体输出', style: Theme.of(context).textTheme.headlineMedium),
-      const SizedBox(height: 16),
-      const Text('AudioShare 不采集或传输音频，连接与输出选择均由系统蓝牙完成。'),
-      const SizedBox(height: 16),
-      const Text('1. 与 Windows 电脑完成蓝牙配对。'),
-      const SizedBox(height: 10),
-      const Text('2. 为这台电脑启用“媒体音频”。'),
-      const SizedBox(height: 10),
-      const Text('3. 播放时在媒体输出中选择这台电脑。'),
-      const SizedBox(height: 20),
-      FilledButton.icon(
-        key: const Key('android-settings'),
-        onPressed: bridge.openBluetoothSettings,
-        icon: const Icon(Icons.settings_bluetooth),
-        label: const Text('打开系统蓝牙设置'),
+  State<_StatusServiceCard> createState() => _StatusServiceCardState();
+}
+
+class _StatusServiceCardState extends State<_StatusServiceCard> {
+  bool? available;
+  String message = '';
+  bool loading = false;
+  int requests = 0;
+  int completed = 0;
+  @override
+  void initState() {
+    super.initState();
+    unawaited(refresh());
+  }
+
+  Future<void> refresh() async {
+    if (loading) return;
+    setState(() {
+      loading = true;
+      requests++;
+    });
+    try {
+      final info = await widget.bridge.getStatusServiceInfo();
+      if (mounted) {
+        setState(() {
+          available = info.available;
+          message = info.message;
+          completed++;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          available = false;
+          message = '$e';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => GlassSurface(
+    child: Padding(
+      padding: const EdgeInsets.all(20),
+      child: Row(
+        children: [
+          Icon(available == true ? Icons.sync : Icons.sync_problem),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('手机状态同步', style: Theme.of(context).textTheme.titleMedium),
+                Text(
+                  loading
+                      ? '正在检查…'
+                      : available == true
+                      ? '可用${message.isEmpty ? '' : '：$message'}'
+                      : '不可用${message.isEmpty ? '' : '：$message'}',
+                ),
+                if (!loading && completed > 0)
+                  Text(
+                    '已读取最新服务状态 · 第 $completed 次（不重新配对或重启音频）',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+              ],
+            ),
+          ),
+          IconButton(
+            key: const Key('refresh-status-service'),
+            tooltip: '重新读取状态服务',
+            onPressed: loading ? null : refresh,
+            icon: AnimatedRotation(
+              key: const Key('status-refresh-rotation'),
+              turns: requests.toDouble(),
+              duration: MediaQuery.disableAnimationsOf(context)
+                  ? Duration.zero
+                  : const Duration(milliseconds: 650),
+              curve: Curves.easeInOutCubic,
+              child: const Icon(Icons.refresh),
+            ),
+          ),
+        ],
       ),
-    ],
+    ),
   );
 }

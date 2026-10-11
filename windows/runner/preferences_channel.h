@@ -1,0 +1,10 @@
+#ifndef RUNNER_PREFERENCES_CHANNEL_H_
+#define RUNNER_PREFERENCES_CHANNEL_H_
+
+#include <flutter/binary_messenger.h>
+
+#include <functional>
+
+std::function<void()> RegisterPreferencesChannel(flutter::BinaryMessenger* messenger);
+
+#endif  // RUNNER_PREFERENCES_CHANNEL_H_

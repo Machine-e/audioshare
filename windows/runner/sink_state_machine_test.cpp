@@ -25,5 +25,22 @@ int main() {
   Check(m.TakeChange(g) == SinkState::disconnected, "terminal during reattach gap");
   auto old = g; g = m.Begin(); m.Stop(); m.Opened(old); Check(m.state() == SinkState::stopped, "old generation ignored");
   m.Error(g); Check(m.state() == SinkState::stopped, "cancel generation ignored");
+  g = m.Begin(0, true);
+  Check(m.startup_pending(), "startup begins pending");
+  Check(!m.Opened(g), "provisional opened is not a stable route");
+  Check(!m.Closed(g), "provisional close must not terminate startup");
+  Check(!m.TakeChange(g), "provisional negotiation produces no route events");
+  Check(m.FinishStartup(g), "startup commits");
+  Check(m.Waiting(g), "closed after successful startup waits for phone");
+  Check(m.Opened(g), "first phone route opens without manual restart");
+  Check(m.Closed(g), "real disconnect still terminates established route");
+  g = m.Begin(0, true);
+  m.Stop();
+  Check(!m.FinishStartup(g), "cancelled startup cannot commit");
+  Check(!m.Opened(g), "late success cannot revive cancelled route");
+  g = m.Begin(0, true);
+  Check(m.Error(g), "startup error is terminal");
+  Check(!m.startup_pending(), "error ends startup");
+  Check(!m.FinishStartup(g), "late completion cannot erase startup error");
   std::cout << "sink_state_machine_test passed\n";
 }

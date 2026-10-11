@@ -9,7 +9,9 @@ enum class SinkState { stopped, waitingForRoute, opened, disconnected, error };
 // Pure state/event delivery core. The channel owns synchronization and resources.
 class SinkStateMachine {
  public:
-  uint64_t Begin(uint64_t generation = 0);
+  uint64_t Begin(uint64_t generation = 0, bool startup_pending = false);
+  bool FinishStartup(uint64_t generation);
+  bool startup_pending() const { return startup_pending_; }
   bool Waiting(uint64_t generation);
   bool Opened(uint64_t generation);
   bool Closed(uint64_t generation);
@@ -27,6 +29,7 @@ class SinkStateMachine {
   SinkState state_ = SinkState::stopped;
   bool opened_once_ = false;
   bool terminal_applied_ = true;
+  bool startup_pending_ = false;
   std::deque<SinkState> changes_;
 };
 }  // namespace audioshare

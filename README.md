@@ -2,8 +2,10 @@
 
 AudioShare is a Bluetooth-only way to play Android media through a Windows PC.
 Windows acts as a classic Bluetooth A2DP Sink. Android uses normal system
-pairing and its media/audio-output selector; the Android app only opens
-Bluetooth settings.
+pairing and its media/audio-output selector. The Android app lists paired and
+nearby PCs, remembers favorites/recent devices, provides receiver-state guidance,
+a short test tone with manual confirmation.
+Normal use does not require root, ADB or USB debugging.
 
 After startup, `waitingForRoute` means the receiver is ready but the phone has
 not selected this PC as media output. Only a real Windows `Opened` event becomes
@@ -18,7 +20,8 @@ Auracast, screen casting, MediaProjection, or Android audio capture.
 - Windows 11 with a Bluetooth adapter/driver that supports A2DP Sink through
   `AudioPlaybackConnection`.
 - An Android phone with classic Bluetooth media output.
-- Both devices paired in their system Bluetooth settings.
+- Android 12+; grant Nearby devices access for device selection and pairing.
+- Both devices paired through the app's system confirmation or Bluetooth settings.
 
 ## Build
 
@@ -41,7 +44,10 @@ Portable artifacts can be packaged with:
 
 ## Use
 
-1. Pair the Android phone and Windows PC using system Bluetooth settings.
+1. Open Windows Bluetooth settings to make the PC discoverable for first pairing.
+   In Android AudioShare, grant Nearby devices access, tap +, then the circular
+   PC card. Confirm the system pairing request on both devices. Already-paired
+   PCs can be selected directly without opening Android Bluetooth settings.
 2. Start AudioShare on Windows, select the paired phone, and enable Bluetooth
    audio reception.
 3. On Android, choose the Windows PC in the system media-output, audio-output,
@@ -49,8 +55,30 @@ Portable artifacts can be packaged with:
 4. Play media and keep AudioShare running while Windows receives audio.
 5. Stop reception in AudioShare before removing the pairing.
 
+Windows remembers the last explicitly selected phone but never starts reception
+automatically. Closing the window offers hide-to-tray, exit, or cancel; hiding
+keeps the receiver alive. Use the tray menu to show the window or exit.
+
+Both apps offer saved light/dark/system appearance from the top-right menu.
+The old system-volume slider has been removed. Independent transmission volume
+and gain above 100% are not implemented in the current A2DP path; the Android
+volume card reports this limitation. The app no longer changes Android's media
+stream volume. The test tone stops after 2.5 seconds or when leaving the app.
+Only the user can confirm hearing it on the PC. A separate authenticated,
+encrypted Bluetooth RFCOMM channel reports Windows receiver state; it carries
+no audio or remote commands. Both apps must be updated to use it. Unknown or
+other-phone receiver targets are never treated as this phone's active route.
+Bluetooth routing uses `BLUETOOTH_CONNECT` and `BLUETOOTH_SCAN`
+(`neverForLocation`), without microphone or foreground-service access.
+The optional updater uses Internet access and requests package installation.
+Favorites/recent PCs stay on the phone. Pin a selected PC to the launcher or add
+the AudioShare Quick Settings tile to reopen the last PC; neither shortcut
+silently changes the global media route. Launcher/tile confirmation is system-owned.
+
 See [the Bluetooth success and troubleshooting guide](docs/blue-tooth-success/README.md)
 for the proven setup and recovery steps.
+See [the phase-one PRD and execution plan](docs/phase-one-prd.md) for scope,
+technical decisions and outstanding hardware acceptance checks.
 
 ## Limitations
 
@@ -61,6 +89,9 @@ for the proven setup and recovery steps.
   version, and phone firmware.
 - A paired device is not necessarily an active media route; Android must select
   the PC as its media output.
+- Public Android APIs cannot silently force global A2DP output or bypass pairing
+  confirmation. Android 14+ offers an in-app system output panel; Android 12–13
+  uses the playing app's media-notification output picker, subject to OEM support.
 - Bluetooth latency and quality are controlled by the system Bluetooth stacks.
 - Calls, alarms, protected media, and non-media audio may route differently.
 - AudioShare does not receive Auracast/LE Audio broadcasts and cannot stream

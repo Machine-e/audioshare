@@ -1,5 +1,8 @@
 #include "external_route_channel.h"
+#include "bluetooth_status_server.h"
 #include "sink_state_machine.h"
+#include "sink_open_retry.h"
+#include "connection_trace.h"
 
 #include <flutter/encodable_value.h>
 #include <flutter/method_channel.h>
@@ -14,6 +17,7 @@
 #include <winrt/base.h>
 
 #include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -29,6 +33,7 @@ using flutter::EncodableMap;
 using flutter::EncodableValue;
 using MethodResult = flutter::MethodResult<EncodableValue>;
 using winrt::Windows::Devices::Enumeration::DeviceInformation;
+using winrt::Windows::Devices::Enumeration::DeviceInformationKind;
 using winrt::Windows::Foundation::IAsyncInfo;
 using winrt::Windows::Media::Audio::AudioPlaybackConnection;
 using winrt::Windows::Media::Audio::AudioPlaybackConnectionOpenResultStatus;
@@ -98,6 +103,7 @@ struct BluetoothState {
   IAsyncInfo pending_operation{nullptr};
   std::unique_ptr<MethodResult> waiter;
   std::string message = kStoppedMessage;
+  std::optional<uint64_t> target_address;
   uint64_t generation = 0;
   audioshare::SinkStateMachine reducer;
   bool shutting_down = false;
@@ -128,6 +134,7 @@ BluetoothResources ResetState(const std::shared_ptr<BluetoothState>& state,
   state->has_state_changed_token = false;
   state->device_id.clear();
   state->pending_operation = nullptr;
+  state->target_address.reset();
   state->message = message;
   state->reducer.Stop();
   state->shutting_down = state->shutting_down || shutdown;
@@ -179,12 +186,70 @@ void ClearPending(const std::shared_ptr<BluetoothState>& state, uint64_t generat
   std::lock_guard<std::mutex> lock(state->mutex);
   if (state->generation == generation) state->pending_operation = nullptr;
 }
+template <typename T>
+bool WaitForAddressOperation(const std::shared_ptr<BluetoothState>& state,
+                             uint64_t generation, const T& operation,
+                             std::chrono::steady_clock::time_point deadline,
+                             std::string& diagnostic) {
+  if (!SetPending(state, generation, operation.template as<IAsyncInfo>())) {
+    operation.Cancel();
+    throw winrt::hresult_canceled();
+  }
+  const auto remaining = deadline - std::chrono::steady_clock::now();
+  const winrt::Windows::Foundation::TimeSpan timeout{
+      std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10000000>>>(
+          remaining).count()};
+  if (remaining <= std::chrono::steady_clock::duration::zero() ||
+      operation.wait_for(timeout) !=
+          winrt::Windows::Foundation::AsyncStatus::Completed) {
+    operation.Cancel();
+    ClearPending(state, generation);
+    if (!Current(state, generation)) throw winrt::hresult_canceled();
+    diagnostic = "device association lookup timed out";
+    return false;
+  }
+  ClearPending(state, generation);
+  if (!Current(state, generation)) throw winrt::hresult_canceled();
+  return true;
+}
+std::optional<uint64_t> ParseBluetoothAddress(const winrt::hstring& value) {
+  if (value.size() != 12 && value.size() != 17) return std::nullopt;
+  uint64_t address = 0;
+  for (winrt::hstring::size_type index = 0; index < value.size(); ++index) {
+    const wchar_t character = value[index];
+    if (value.size() == 17 && index % 3 == 2) {
+      if (character != L':') return std::nullopt;
+      continue;
+    }
+    uint64_t digit;
+    if (character >= L'0' && character <= L'9') digit = character - L'0';
+    else if (character >= L'a' && character <= L'f') digit = character - L'a' + 10;
+    else if (character >= L'A' && character <= L'F') digit = character - L'A' + 10;
+    else return std::nullopt;
+    address = (address << 4) | digit;
+  }
+  return address;
+}
+std::optional<winrt::hstring> StringProperty(
+    const DeviceInformation& device, const wchar_t* name) {
+  if (!device) return std::nullopt;
+  const auto value = device.Properties().TryLookup(name);
+  if (!value) return std::nullopt;
+  try { return winrt::unbox_value<winrt::hstring>(value); }
+  catch (...) { return std::nullopt; }
+}
+void LogAddressDiagnostic(const std::string& reason) {
+  const std::string message =
+      "AudioShare: Bluetooth target address unavailable: " + reason + "\n";
+  OutputDebugStringA(message.c_str());
+}
 void SetError(const std::shared_ptr<BluetoothState>& state, uint64_t generation,
               const std::string& message) {
   std::lock_guard<std::mutex> lock(state->mutex);
   if (!state->shutting_down && state->generation == generation) {
     state->pending_operation = nullptr;
     state->message = message;
+    state->reducer.Error(generation);
   }
 }
 bool TakeConnection(const std::shared_ptr<BluetoothState>& state,
@@ -233,6 +298,17 @@ void OnStateChanged(const std::weak_ptr<BluetoothState>& weak_state,
                     const std::weak_ptr<BackgroundExecutor>& weak_executor,
                     uint64_t generation,
                     const AudioPlaybackConnection& sender) noexcept {
+  auto state = weak_state.lock();
+  if (!state) return;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    // StartAsync/OpenAsync can temporarily alternate Opened/Closed while the
+    // driver negotiates the first route. Do not tear down the connection from
+    // those provisional events. Startup samples State after OpenAsync settles.
+    if (state->shutting_down || state->generation != generation ||
+        state->reducer.startup_pending() || !state->connection || state->connection != sender)
+      return;
+  }
   AudioPlaybackConnectionState connection_state =
       AudioPlaybackConnectionState::Closed;
   bool state_read_failed = false;
@@ -241,12 +317,12 @@ void OnStateChanged(const std::weak_ptr<BluetoothState>& weak_state,
   } catch (...) {
     state_read_failed = true;
   }
-  auto state = weak_state.lock();
-  if (!state) return;
   if (state_read_failed) {
+    audioshare::TraceConnection(generation, "state_read_failed");
     {
       std::lock_guard<std::mutex> lock(state->mutex);
-      if (state->generation != generation || !state->reducer.Error(generation)) return;
+      if (state->generation != generation || state->connection != sender ||
+          !state->reducer.Error(generation)) return;
     }
     BluetoothResources resources;
     if (!TakeConnection(state, generation, sender, "Could not read Bluetooth connection state.", resources)) return;
@@ -265,14 +341,15 @@ void OnStateChanged(const std::weak_ptr<BluetoothState>& weak_state,
     std::unique_ptr<MethodResult> waiter;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
-    if (!state->shutting_down && state->generation == generation &&
-        state->connection && state->connection == sender) {
-      if (state->reducer.Opened(generation)) {
-        state->message = StateMessage(audioshare::SinkState::opened);
-        waiter = std::move(state->waiter);
-        if (waiter) state->reducer.TakeChange(generation);
+      if (!state->shutting_down && state->generation == generation &&
+          state->connection && state->connection == sender) {
+        if (state->reducer.Opened(generation)) {
+          audioshare::TraceConnection(generation, "route_opened");
+          state->message = StateMessage(audioshare::SinkState::opened);
+          waiter = std::move(state->waiter);
+          if (waiter) state->reducer.TakeChange(generation);
+        }
       }
-    }
     }
     if (waiter) waiter->Success(Status("opened", "The phone media route is connected."));
     return;
@@ -289,6 +366,7 @@ void OnStateChanged(const std::weak_ptr<BluetoothState>& weak_state,
     }
   }
   BluetoothResources resources;
+  audioshare::TraceConnection(generation, "route_disconnected");
   if (!TakeConnection(state, generation, sender, "The phone media route disconnected.", resources))
     return;
   if (resources.waiter) {
@@ -321,8 +399,20 @@ std::function<void()> RegisterExternalRouteChannel(flutter::BinaryMessenger* mes
       messenger, kChannelName, &flutter::StandardMethodCodec::GetInstance());
   auto state = std::make_shared<BluetoothState>();
   auto executor = std::make_shared<BackgroundExecutor>();
+  auto status_server = std::make_shared<audioshare::BluetoothStatusServer>(
+      [weak_state = std::weak_ptr<BluetoothState>(state)](uint64_t peer) {
+        audioshare::BluetoothStatusSnapshot snapshot{"stopped", "unknown"};
+        const auto locked = weak_state.lock();
+        if (!locked) return snapshot;
+        std::lock_guard<std::mutex> lock(locked->mutex);
+        snapshot.mode = locked->reducer.startup_pending() ? "starting" : Mode(locked->reducer.state());
+        if (locked->target_address)
+          snapshot.target = *locked->target_address == peer ? "thisPhone" : "otherPhone";
+        return snapshot;
+      });
+  status_server->Start();
   channel->SetMethodCallHandler(
-      [state, executor](const flutter::MethodCall<EncodableValue>& call,
+      [state, executor, status_server](const flutter::MethodCall<EncodableValue>& call,
                         std::unique_ptr<MethodResult> result) {
     const auto& method = call.method_name();
     if (method == "listBluetoothDevices") {
@@ -353,47 +443,203 @@ std::function<void()> RegisterExternalRouteChannel(flutter::BinaryMessenger* mes
       if (id_string.empty()) { result->Success(Status("error", "Missing Bluetooth device ID.")); return; }
       auto old = ResetState(state, "Bluetooth audio receiver is starting.");
       const uint64_t generation = old.generation;
-      { std::lock_guard<std::mutex> lock(state->mutex); state->reducer.Begin(generation); }
+      audioshare::TraceConnection(generation, "user_start");
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->reducer.Begin(generation, true);
+      }
       ReleaseResources(executor, std::move(old));
       executor->Post([state, executor, generation, id_string,
                       result = std::move(result)]() mutable {
         AudioPlaybackConnection connection{nullptr};
-        winrt::event_token token{}; bool subscribed = false;
+        winrt::event_token token{};
+        bool subscribed = false;
+        bool ownership_transferred = false;
         try {
           if (!Current(state, generation)) { result->Success(Status("stopped", "Bluetooth startup was cancelled.")); return; }
           const auto id = winrt::to_hstring(id_string);
-          connection = AudioPlaybackConnection::TryCreateFromId(id);
-          if (!connection) { const std::string m = "Windows could not create a Bluetooth audio connection. Pair the phone first."; SetError(state, generation, m); result->Success(Status("error", m)); return; }
+          // AudioPlaybackConnection IDs identify device interfaces, not
+          // BluetoothDevice instances. Walk the explicit DeviceInformation
+          // association properties without opening the remote device.
+          try {
+            constexpr wchar_t kAddress[] = L"System.DeviceInterface.Bluetooth.DeviceAddress";
+            constexpr wchar_t kAepAddress[] = L"System.Devices.Aep.DeviceAddress";
+            constexpr wchar_t kInstanceId[] = L"System.Devices.DeviceInstanceId";
+            constexpr wchar_t kAepId[] = L"System.Devices.Aep.AepId";
+            constexpr wchar_t kProtocolId[] = L"System.Devices.Aep.ProtocolId";
+            const winrt::guid kBluetoothClassic{
+                0xe0cbf06c, 0xcd8b, 0x4647, {0xbb, 0x8a, 0x26, 0x3b, 0x43, 0xf0, 0xf9, 0x74}};
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(3);
+            std::string diagnostic;
+            std::optional<uint64_t> address;
+            auto interface_operation = DeviceInformation::CreateFromIdAsync(
+                id, {kAddress, kInstanceId}, DeviceInformationKind::DeviceInterface);
+            if (WaitForAddressOperation(state, generation, interface_operation,
+                                        deadline, diagnostic)) {
+              const auto interface_info = interface_operation.get();
+              if (const auto direct = StringProperty(interface_info, kAddress))
+                address = ParseBluetoothAddress(*direct);
+              if (!address) {
+                const auto instance_id = StringProperty(interface_info, kInstanceId);
+                if (!instance_id || instance_id->empty()) {
+                  diagnostic = "interface has no device-instance association";
+                } else {
+                  auto device_operation = DeviceInformation::CreateFromIdAsync(
+                      *instance_id, {kAepId}, DeviceInformationKind::Device);
+                  if (WaitForAddressOperation(state, generation, device_operation,
+                                              deadline, diagnostic)) {
+                    const auto device_info = device_operation.get();
+                    const auto aep_id = StringProperty(device_info, kAepId);
+                    if (!aep_id || aep_id->empty()) {
+                      diagnostic = "device has no association-endpoint ID";
+                    } else {
+                      auto aep_operation = DeviceInformation::CreateFromIdAsync(
+                          *aep_id, {kProtocolId, kAepAddress},
+                          DeviceInformationKind::AssociationEndpoint);
+                      if (WaitForAddressOperation(state, generation, aep_operation,
+                                                  deadline, diagnostic)) {
+                        const auto aep = aep_operation.get();
+                        if (!aep) throw winrt::hresult_error(E_FAIL, L"Association endpoint disappeared");
+                        const auto protocol_value = aep.Properties().TryLookup(kProtocolId);
+                        bool classic = false;
+                        if (protocol_value) try {
+                          classic = winrt::unbox_value<winrt::guid>(protocol_value) ==
+                                    kBluetoothClassic;
+                        } catch (...) {}
+                        if (!classic) {
+                          diagnostic = "association endpoint is not Bluetooth Classic";
+                        } else if (const auto associated = StringProperty(aep, kAepAddress)) {
+                          address = ParseBluetoothAddress(*associated);
+                          if (!address) diagnostic = "association address is not a 48-bit string";
+                        } else {
+                          diagnostic = "association endpoint has no address";
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            if (address) {
+              std::lock_guard<std::mutex> lock(state->mutex);
+              if (!state->shutting_down && state->generation == generation)
+                state->target_address = *address;
+            } else {
+              if (diagnostic.empty()) diagnostic = "interface address is not a 48-bit string";
+              LogAddressDiagnostic(diagnostic);
+            }
+          } catch (const winrt::hresult_error& e) {
+            // Address failure only makes target unknown; A2DP startup continues.
+            ClearPending(state, generation);
+            if (!Current(state, generation)) throw;
+            LogAddressDiagnostic("DeviceInformation lookup failed (HRESULT " +
+                                 std::to_string(static_cast<uint32_t>(e.code())) + ")");
+          }
+          if (!Current(state, generation)) throw winrt::hresult_canceled();
+          using audioshare::SinkOpenOutcome;
+          std::string open_diagnostic;
+          const auto outcome = audioshare::RecoverSinkSessionOnce([&] {
+            audioshare::TraceConnection(generation, "create_connection");
+            connection = AudioPlaybackConnection::TryCreateFromId(id);
+            if (!connection) throw winrt::hresult_error(E_FAIL, L"Windows could not create a Bluetooth audio connection. Pair the phone first.");
+            token = connection.StateChanged(
+                [weak_state = std::weak_ptr<BluetoothState>(state),
+                 weak_executor = std::weak_ptr<BackgroundExecutor>(executor),
+                 generation](auto&& sender, auto&&) {
+                  OnStateChanged(weak_state, weak_executor, generation, sender);
+                });
+            subscribed = true;
+            {
+              std::lock_guard<std::mutex> lock(state->mutex);
+              if (state->shutting_down || state->generation != generation)
+                throw winrt::hresult_canceled();
+              state->connection = connection;
+              state->device_id = id;
+              state->state_changed_token = token;
+              state->has_state_changed_token = true;
+              ownership_transferred = true;
+            }
+            // StateChanged may be reentrant; installation above makes the handler
+            // recognize this connection. Sample immediately to close the boundary.
+            OnStateChanged(std::weak_ptr<BluetoothState>(state),
+                           std::weak_ptr<BackgroundExecutor>(executor), generation,
+                           connection);
+            auto start = connection.StartAsync();
+            audioshare::TraceConnection(generation, "start_async");
+            if (!SetPending(state, generation, start.as<IAsyncInfo>())) { start.Cancel(); throw winrt::hresult_canceled(); }
+            start.get(); ClearPending(state, generation);
+            audioshare::TraceConnection(generation, "start_complete");
+            // A newly enabled A2DP service can fail its first open while SDP and
+            // the phone's route catch up. Keep the started sink alive and retry
+            // transient failures; an explicit stop cancels both open and backoff.
+            return audioshare::OpenSinkWithRetry([&] {
+              try {
+                auto open = connection.OpenAsync();
+                audioshare::TraceConnection(generation, "open_async");
+                if (!SetPending(state, generation, open.as<IAsyncInfo>())) {
+                  open.Cancel(); return SinkOpenOutcome::cancelled;
+                }
+                const auto opened = open.get();
+                ClearPending(state, generation);
+                audioshare::TraceConnection(generation, "open_result=" +
+                    std::to_string(static_cast<int>(opened.Status())) + " hresult=" +
+                    std::to_string(static_cast<int32_t>(opened.ExtendedError())));
+                // Denial must win over a stale or provisional Opened state.
+                if (opened.Status() == AudioPlaybackConnectionOpenResultStatus::DeniedBySystem)
+                  return SinkOpenOutcome::denied;
+                if (opened.Status() == AudioPlaybackConnectionOpenResultStatus::Success ||
+                    connection.State() == AudioPlaybackConnectionState::Opened)
+                  return SinkOpenOutcome::opened;
+                open_diagnostic = "OpenAsync status=" +
+                    std::to_string(static_cast<int>(opened.Status())) +
+                    ", HRESULT=" + std::to_string(static_cast<int32_t>(opened.ExtendedError()));
+                return SinkOpenOutcome::transient_failure;
+              } catch (const winrt::hresult_error& error) {
+                ClearPending(state, generation);
+                if (!Current(state, generation) || error.code() == E_ABORT ||
+                    error.code() == HRESULT_FROM_WIN32(ERROR_CANCELLED))
+                  return SinkOpenOutcome::cancelled;
+                if (error.code() == E_ACCESSDENIED) return SinkOpenOutcome::denied;
+                // Invalid arguments, disposed objects, and other programming
+                // errors must not be disguised as transient driver negotiation.
+                if (error.code() != E_FAIL &&
+                    error.code() != HRESULT_FROM_WIN32(ERROR_TIMEOUT) &&
+                    error.code() != HRESULT_FROM_WIN32(ERROR_NOT_READY)) throw;
+                open_diagnostic = ErrorMessage("OpenAsync", error);
+                return SinkOpenOutcome::transient_failure;
+              }
+            }, [&] { return Current(state, generation); }, [](auto delay) {
+              std::this_thread::sleep_for(delay);
+            });
+          }, [&] {
+            audioshare::TraceConnection(generation, "rebuild_failed_connection");
+            // Detach the failed native session before disposing it. This is the
+            // same lifetime boundary as Stop, without ending the user's request.
+            BluetoothResources failed;
+            if (!TakeConnection(state, generation, connection,
+                                "Retrying Bluetooth receiver startup.", failed))
+              throw winrt::hresult_canceled();
+            CloseResources(std::move(failed));
+            connection = nullptr;
+            subscribed = false;
+            ownership_transferred = false;
+            for (int tick = 0; tick < 10; ++tick) {
+              if (!Current(state, generation)) throw winrt::hresult_canceled();
+              std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+          }, [&] { return Current(state, generation); });
+          if (outcome == SinkOpenOutcome::cancelled) throw winrt::hresult_canceled();
+          if (outcome == SinkOpenOutcome::denied) throw winrt::hresult_access_denied();
+          if (outcome != SinkOpenOutcome::opened)
+            throw winrt::hresult_error(E_FAIL, winrt::to_hstring(
+                "Bluetooth media route could not open after rebuilding the receiver. " + open_diagnostic));
           {
             std::lock_guard<std::mutex> lock(state->mutex);
-            if (state->shutting_down || state->generation != generation) throw winrt::hresult_canceled();
-            state->connection = connection; state->device_id = id;
+            if (state->shutting_down || state->generation != generation)
+              throw winrt::hresult_canceled();
+            state->reducer.FinishStartup(generation);
           }
-          token = connection.StateChanged(
-              [weak_state = std::weak_ptr<BluetoothState>(state),
-               weak_executor = std::weak_ptr<BackgroundExecutor>(executor),
-               generation](auto&& sender, auto&&) {
-                OnStateChanged(weak_state, weak_executor, generation, sender);
-              });
-          subscribed = true;
-          {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            if (state->generation != generation || state->connection != connection) throw winrt::hresult_canceled();
-            state->state_changed_token = token; state->has_state_changed_token = true;
-          }
-          // StateChanged may be reentrant; installation above makes the handler
-          // recognize this connection. Sample immediately to close the boundary.
-          OnStateChanged(std::weak_ptr<BluetoothState>(state),
-                         std::weak_ptr<BackgroundExecutor>(executor), generation,
-                         connection);
-          auto start = connection.StartAsync();
-          if (!SetPending(state, generation, start.as<IAsyncInfo>())) { start.Cancel(); throw winrt::hresult_canceled(); }
-          start.get(); ClearPending(state, generation);
-          auto open = connection.OpenAsync();
-          if (!SetPending(state, generation, open.as<IAsyncInfo>())) { open.Cancel(); throw winrt::hresult_canceled(); }
-          auto opened = open.get(); ClearPending(state, generation);
-          if (opened.Status() != AudioPlaybackConnectionOpenResultStatus::Success)
-            throw winrt::hresult_error(E_FAIL, L"AudioPlaybackConnection.OpenAsync failed");
           // Sample through the same production transition path used by events.
           // This both closes the subscription/startup boundary and releases the
           // connection if an observed Opened route has already become Closed.
@@ -410,9 +656,11 @@ std::function<void()> RegisterExternalRouteChannel(flutter::BinaryMessenger* mes
             initial = state->reducer.TakeInitial(generation);
             state->message = StateMessage(initial);
           }
-          subscribed = false;
           result->Success(Status(Mode(initial), StateMessage(initial)));
+          audioshare::TraceConnection(generation, std::string("startup_finished=") + Mode(initial));
         } catch (const winrt::hresult_error& e) {
+          audioshare::TraceConnection(generation, "startup_exception=" +
+              std::to_string(static_cast<int32_t>(e.code())));
           bool current = Current(state, generation);
           std::optional<audioshare::SinkState> natural_terminal;
           if (current) {
@@ -424,13 +672,13 @@ std::function<void()> RegisterExternalRouteChannel(flutter::BinaryMessenger* mes
             }
           }
           if (natural_terminal) {
-            if (subscribed) {
+            if (!ownership_transferred && subscribed) {
               try {
                 connection.StateChanged(token);
               } catch (...) {
               }
             }
-            if (connection) {
+            if (!ownership_transferred && connection) {
               try {
                 connection.Close();
               } catch (...) {
@@ -448,15 +696,16 @@ std::function<void()> RegisterExternalRouteChannel(flutter::BinaryMessenger* mes
               current && TakeConnection(state, generation, connection, message,
                                         installed_resources);
           if (installed) {
-            subscribed = false;
+            ownership_transferred = false;
             CloseResources(std::move(installed_resources));
+            SetError(state, generation, message);
           } else {
-            if (subscribed)
+            if (!ownership_transferred && subscribed)
               try {
                 connection.StateChanged(token);
               } catch (...) {
               }
-            if (connection)
+            if (!ownership_transferred && connection)
               try {
                 connection.Close();
               } catch (...) {
@@ -512,19 +761,31 @@ std::function<void()> RegisterExternalRouteChannel(flutter::BinaryMessenger* mes
     }
     if (method == "stopBluetoothSink") {
       auto resources = ResetState(state, kStoppedMessage);
+      audioshare::TraceConnection(resources.generation, "user_stop");
       ReleaseResources(executor, std::move(resources));
       result->Success(Status("stopped", kStoppedMessage)); return;
     }
     if (method == "openBluetoothSettings") {
       const bool launched = LaunchBluetoothSettings();
-      result->Success(Status(launched ? "ready" : "error",
-                             launched ? "Opened Windows Bluetooth settings." : "Could not open Windows Bluetooth settings."));
+      if (launched) {
+        result->Success();
+      } else {
+        result->Error("settings_failed", "Could not open Windows Bluetooth settings.");
+      }
+      return;
+    }
+    if (method == "getStatusServiceInfo") {
+      const auto info = status_server->GetInfo();
+      result->Success(EncodableValue(EncodableMap{
+          {EncodableValue("available"), EncodableValue(info.available)},
+          {EncodableValue("message"), EncodableValue(info.message)}}));
       return;
     }
     result->NotImplemented();
   });
-  return [channel, state, executor, ro_initialized]() {
+  return [channel, state, executor, status_server, ro_initialized]() {
     channel->SetMethodCallHandler(nullptr);
+    status_server->Stop();
     auto resources = ResetState(state, kStoppedMessage, true);
     ReleaseResources(executor, std::move(resources), false);
     executor->Stop();

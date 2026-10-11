@@ -24,6 +24,11 @@ class FlutterWindow : public Win32Window {
                          LPARAM const lparam) noexcept override;
 
  private:
+  bool AddTrayIcon();
+  void RemoveTrayIcon();
+  void ShowFromTray();
+  void ShowTrayMenu();
+
   // The project to run.
   flutter::DartProject project_;
 
@@ -32,6 +37,13 @@ class FlutterWindow : public Win32Window {
 
   // Keeps native channel cleanup callbacks alive until the engine is destroyed.
   std::function<void()> external_route_channel_cleanup_;
+  std::function<void()> preferences_channel_cleanup_;
+
+  UINT taskbar_created_message_ = 0;
+  HWND tray_window_ = nullptr;
+  bool tray_icon_added_ = false;
+  bool close_prompt_open_ = false;
+  bool destroying_ = false;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

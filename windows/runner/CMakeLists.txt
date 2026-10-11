@@ -7,9 +7,11 @@ project(runner LANGUAGES CXX)
 #
 # Any new source files that you add to the application should be added here.
 add_executable(${BINARY_NAME} WIN32
+  "bluetooth_status_server.cpp"
   "external_route_channel.cpp"
   "sink_state_machine.cpp"
   "flutter_window.cpp"
+  "preferences_channel.cpp"
   "main.cpp"
   "utils.cpp"
   "win32_window.cpp"
@@ -21,6 +23,7 @@ add_executable(${BINARY_NAME} WIN32
 # Apply the standard set of build settings. This can be removed for applications
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
+target_compile_options(${BINARY_NAME} PRIVATE /utf-8)
 
 # Add preprocessor definitions for the build version.
 target_compile_definitions(${BINARY_NAME} PRIVATE "FLUTTER_VERSION=\"${FLUTTER_VERSION}\"")
@@ -35,7 +38,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # Add dependency libraries and include directories. Add any application-specific
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
-target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "ole32.lib" "runtimeobject.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib" "ole32.lib" "runtimeobject.lib" "shell32.lib" "advapi32.lib" "ws2_32.lib" "bthprops.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.
@@ -46,3 +49,9 @@ add_executable(sink_state_machine_test EXCLUDE_FROM_ALL
   "sink_state_machine_test.cpp"
 )
 target_compile_features(sink_state_machine_test PRIVATE cxx_std_17)
+
+add_executable(sink_open_retry_test EXCLUDE_FROM_ALL
+  "sink_state_machine.cpp"
+  "sink_open_retry_test.cpp"
+)
+target_compile_features(sink_open_retry_test PRIVATE cxx_std_17)

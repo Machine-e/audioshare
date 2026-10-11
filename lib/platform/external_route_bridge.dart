@@ -39,10 +39,70 @@ class BluetoothSinkStatus {
   }
 }
 
+class MediaVolume {
+  const MediaVolume({
+    required this.current,
+    required this.max,
+    required this.fixed,
+    this.available = true,
+    this.message = '',
+  });
+  final int current;
+  final int max;
+  final bool fixed;
+  final bool available;
+  final String message;
+
+  factory MediaVolume.fromMap(Map<dynamic, dynamic> map) => MediaVolume(
+    current: (map['current'] as num?)?.toInt() ?? 0,
+    max: (map['max'] as num?)?.toInt() ?? 0,
+    fixed: map['fixed'] == true,
+    available: map['available'] == true,
+    message: map['message']?.toString() ?? '当前音频通路不支持独立音量。',
+  );
+}
+
 class ExternalRouteBridge {
   static const MethodChannel _channel = MethodChannel(
     'com.machinee.audioshare/external_route',
   );
+  static const MethodChannel _preferences = MethodChannel(
+    'com.machinee.audioshare/preferences',
+  );
+
+  Future<String?> readThemeMode() =>
+      _preferences.invokeMethod<String>('readThemeMode');
+
+  Future<void> writeThemeMode(String mode) =>
+      _preferences.invokeMethod<void>('writeThemeMode', {'mode': mode});
+
+  Future<MediaVolume> getMediaVolume() async => MediaVolume.fromMap(
+    (await _channel.invokeMethod<dynamic>('getMediaVolume'))
+        as Map<dynamic, dynamic>,
+  );
+
+  Future<MediaVolume> setMediaVolume(int value) async => MediaVolume.fromMap(
+    (await _channel.invokeMethod<dynamic>('setMediaVolume', {'value': value}))
+        as Map<dynamic, dynamic>,
+  );
+
+  Future<void> playTestTone() => _channel.invokeMethod<void>('playTestTone');
+  Future<void> stopTestTone() => _channel.invokeMethod<void>('stopTestTone');
+
+  Future<({bool available, String message})> getStatusServiceInfo() async {
+    final value = await _channel.invokeMethod<dynamic>('getStatusServiceInfo');
+    final map = value as Map<dynamic, dynamic>;
+    return (
+      available: map['available'] == true,
+      message: map['message']?.toString() ?? '',
+    );
+  }
+
+  Future<String?> readPreferredDevice() =>
+      _preferences.invokeMethod<String>('readPreferredDevice');
+
+  Future<void> writePreferredDevice(String deviceId) => _preferences
+      .invokeMethod<void>('writePreferredDevice', {'deviceId': deviceId});
 
   Future<List<BluetoothDeviceInfo>> listBluetoothDevices() async {
     if (!Platform.isWindows) return const [];
