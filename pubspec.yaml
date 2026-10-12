@@ -1,7 +1,7 @@
 name: audioshare
 description: Use a Windows PC as a Bluetooth A2DP audio receiver.
 publish_to: 'none'
-version: 0.2.5+7
+version: 0.2.6+8
 
 environment:
   sdk: ^3.12.2
@@ -19,13 +19,11 @@ flutter:
   uses-material-design: true
 
   fonts:
-    - family: Geist Sans
+    - family: MiSans
       fonts:
-        - asset: assets/fonts/geist/Geist-Regular.ttf
+        - asset: assets/fonts/misans/MiSans-Regular.otf
           weight: 400
-        - asset: assets/fonts/geist/Geist-Medium.ttf
+        - asset: assets/fonts/misans/MiSans-Medium.otf
           weight: 500
-        - asset: assets/fonts/geist/Geist-SemiBold.ttf
+        - asset: assets/fonts/misans/MiSans-Semibold.otf
           weight: 600
-        - asset: assets/fonts/geist/Geist-Bold.ttf
-          weight: 700

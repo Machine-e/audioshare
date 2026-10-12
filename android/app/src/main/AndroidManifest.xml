@@ -9,7 +9,8 @@
     <application
         android:label="AudioShare"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -36,7 +37,7 @@
             android:name=".AudioShareTileService"
             android:exported="true"
             android:label="AudioShare"
-            android:icon="@drawable/ic_laptop"
+            android:icon="@drawable/ic_audioshare_monochrome"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />

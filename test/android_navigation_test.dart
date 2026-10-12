@@ -10,6 +10,7 @@ CompanionSnapshot observation(
   int revision, {
   bool connected = false,
   bool known = true,
+  String message = '',
 }) => CompanionSnapshot(
   revision: revision,
   permission: true,
@@ -17,6 +18,7 @@ CompanionSnapshot observation(
   selectedDeviceId: 'pc',
   outputSwitcherSupported: true,
   controlState: CompanionControlState.unavailable,
+  message: message,
   devices: [
     CompanionDevice(
       id: 'pc',
@@ -29,6 +31,33 @@ CompanionSnapshot observation(
 );
 
 void main() {
+  testWidgets('computer message has its own padded block below media actions', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(320, 900);
+    tester.platformDispatcher.textScaleFactorTestValue = 2;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+    await pumpAndroid(
+      tester,
+      FakeCompanionBridge(
+        observation(1, connected: true, message: '控制状态已连接，正在等待电脑报告当前接收状态。'),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final message = find.text('电脑消息：控制状态已连接，正在等待电脑报告当前接收状态。');
+    await tester.ensureVisible(message);
+    await tester.pumpAndSettle();
+    final output = tester.getRect(find.byKey(const Key('output-switcher')));
+    final note = tester.getRect(message);
+    expect(note.top - output.bottom, greaterThanOrEqualTo(32));
+    expect(note.right, lessThanOrEqualTo(300));
+    expect(find.byKey(const Key('computer-message')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
     'tabs retain connection subscription and separate playback from settings',
     (tester) async {

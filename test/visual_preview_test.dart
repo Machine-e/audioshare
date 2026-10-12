@@ -1,9 +1,13 @@
 // Render the real Flutter screens with simulated platform data, not hardware.
 // Export PNGs: flutter test test/visual_preview_test.dart --dart-define=EXPORT_PREVIEWS=true
 import 'dart:io';
+import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:audioshare/main.dart';
+import 'package:audioshare/android_screen.dart';
+import 'package:audioshare/app_style.dart';
+import 'package:audioshare/platform/android_update_bridge.dart';
 import 'package:audioshare/platform/companion_bridge.dart';
 import 'package:audioshare/platform/external_route_bridge.dart';
 import 'package:flutter/material.dart';
@@ -13,20 +17,40 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'widget_test.dart' show FakeBridge, FakeCompanion, status;
 
+class PreviewUpdateBridge extends AndroidUpdateBridge {
+  final completion = Completer<void>();
+  @override
+  Future<AndroidUpdateInfo> checkForUpdate() async => const AndroidUpdateInfo(
+    available: true,
+    currentVersion: '0.2.5',
+    latestVersion: '0.2.6',
+    downloadUrl: 'preview',
+    message: '发现新版本 0.2.6',
+  );
+  @override
+  Future<void> downloadAndInstall(
+    String url, {
+    void Function(AndroidDownloadProgress)? onProgress,
+  }) {
+    onProgress?.call(
+      const AndroidDownloadProgress(
+        received: 21 * 1024 * 1024,
+        total: 50 * 1024 * 1024,
+      ),
+    );
+    return completion.future;
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   const export = bool.fromEnvironment('EXPORT_PREVIEWS');
   setUpAll(() async {
     if (!export) return;
-    // Local Windows CJK font is used only for review artifacts, never bundled.
-    final cjk = File(r'C:\Windows\Fonts\msyh.ttc');
-    final text = FontLoader('Geist Sans');
-    if (await cjk.exists()) {
-      text.addFont(
-        cjk.readAsBytes().then((bytes) => ByteData.sublistView(bytes)),
-      );
+    final text = FontLoader('MiSans');
+    for (final weight in ['Regular', 'Medium', 'Semibold']) {
+      text.addFont(rootBundle.load('assets/fonts/misans/MiSans-$weight.otf'));
     }
-    text.addFont(rootBundle.load('assets/fonts/geist/Geist-Regular.ttf'));
     await text.load();
     await (FontLoader(
       'MaterialIcons',
@@ -34,6 +58,18 @@ void main() {
   });
 
   for (final scenario in [
+    (
+      'android-download',
+      TargetPlatform.android,
+      Size(412, 1100),
+      Brightness.light,
+    ),
+    (
+      'android-message',
+      TargetPlatform.android,
+      Size(412, 1100),
+      Brightness.light,
+    ),
     (
       'android-devices',
       TargetPlatform.android,
@@ -189,6 +225,7 @@ void main() {
           bluetoothEnabled: true,
           discovering: scenario.$1 == 'android-scanning',
           outputSwitcherSupported: true,
+          message: scenario.$1 == 'android-message' ? '控制状态已连接' : '',
           devices: scenario.$1 == 'android-empty'
               ? const []
               : [
@@ -223,15 +260,31 @@ void main() {
         ),
       );
       addTearDown(companion.events.close);
+      final previewUpdate = PreviewUpdateBridge();
       const capture = Key('preview-capture');
       await tester.pumpWidget(
         RepaintBoundary(
           key: capture,
-          child: AudioShareApp(
-            bridge: bridge,
-            companionBridge: companion,
-            platform: scenario.$2,
-          ),
+          child: scenario.$1 == 'android-download'
+              ? MaterialApp(
+                  debugShowCheckedModeBanner: false,
+                  theme: audioShareTheme(Brightness.light),
+                  home: AmbientBackground(
+                    child: Scaffold(
+                      appBar: AppBar(title: const Text('AudioShare')),
+                      body: AndroidScreen(
+                        routeBridge: bridge,
+                        companionBridge: companion,
+                        updateBridge: previewUpdate,
+                      ),
+                    ),
+                  ),
+                )
+              : AudioShareApp(
+                  bridge: bridge,
+                  companionBridge: companion,
+                  platform: scenario.$2,
+                ),
         ),
       );
       if ([
@@ -266,6 +319,13 @@ void main() {
       }
       if (scenario.$1 == 'android-settings') {
         await tester.tap(find.byKey(const Key('nav-settings')));
+        await tester.pumpAndSettle();
+      }
+      if (scenario.$1 == 'android-download') {
+        await tester.tap(find.byKey(const Key('nav-settings')));
+        await tester.pumpAndSettle();
+        await tester.ensureVisible(find.byKey(const Key('install-update')));
+        await tester.tap(find.byKey(const Key('install-update')));
         await tester.pumpAndSettle();
       }
       if (scenario.$1 == 'android-confirmed') {
@@ -330,6 +390,9 @@ void main() {
         }
       }
       await tester.pumpWidget(const SizedBox.shrink());
+      if (scenario.$1 == 'android-download') {
+        previewUpdate.completion.complete();
+      }
     });
   }
 }

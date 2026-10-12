@@ -483,11 +483,11 @@ class CompanionController(
         val manager = activity.getSystemService(ShortcutManager::class.java)
         if (!manager.isRequestPinShortcutSupported) return false
         val launch = Intent(activity, MainActivity::class.java).setAction(Intent.ACTION_VIEW).putExtra(EXTRA_DEVICE, id).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        return manager.requestPinShortcut(ShortcutInfo.Builder(activity, "device_$id").setShortLabel(seen[id]?.let(::safeName) ?: "AudioShare PC").setIcon(Icon.createWithResource(activity, com.machinee.audioshare.R.drawable.ic_laptop)).setIntent(launch).build(), null)
+        return manager.requestPinShortcut(ShortcutInfo.Builder(activity, "device_$id").setShortLabel(seen[id]?.let(::safeName) ?: "AudioShare PC").setIcon(Icon.createWithResource(activity, com.machinee.audioshare.R.mipmap.ic_launcher)).setIntent(launch).build(), null)
     }
     private fun addQuickTile(): Boolean {
         if (Build.VERSION.SDK_INT < 33) return false
-        activity.getSystemService(StatusBarManager::class.java).requestAddTileService(ComponentName(activity, AudioShareTileService::class.java), "AudioShare", Icon.createWithResource(activity, com.machinee.audioshare.R.drawable.ic_laptop), activity.mainExecutor) {}
+        activity.getSystemService(StatusBarManager::class.java).requestAddTileService(ComponentName(activity, AudioShareTileService::class.java), "AudioShare", Icon.createWithResource(activity, com.machinee.audioshare.R.drawable.ic_audioshare_monochrome), activity.mainExecutor) {}
         return true
     }
 

@@ -35,6 +35,7 @@ class _AndroidScreenState extends State<AndroidScreen>
   AndroidUpdateInfo? updateInfo;
   String? updateError;
   bool updateChecking = false, updateInstalling = false;
+  AndroidDownloadProgress? downloadProgress;
   bool busy = false, tone = false, toneStarted = false, statusRetrying = false;
   int statusRefreshes = 0;
   int _lastRevision = -1;
@@ -194,15 +195,30 @@ class _AndroidScreenState extends State<AndroidScreen>
     if (update == null || !update.available || updateInstalling) return;
     setState(() {
       updateInstalling = true;
+      downloadProgress = const AndroidDownloadProgress();
       updateError = null;
-      info = '正在下载更新，完成后会打开系统安装器…';
     });
     try {
-      await widget.updateBridge!.downloadAndInstall(update.downloadUrl);
+      await widget.updateBridge!.downloadAndInstall(
+        update.downloadUrl,
+        onProgress: (progress) {
+          if (mounted && updateInstalling) {
+            setState(() => downloadProgress = progress);
+          }
+        },
+      );
+      if (mounted) {
+        setState(() {
+          updateInstalling = false;
+          downloadProgress = null;
+          info = '安装包已下载，请在系统安装器中确认更新。';
+        });
+      }
     } catch (e) {
       if (mounted) {
         setState(() {
           updateInstalling = false;
+          downloadProgress = null;
           updateError = e is PlatformException
               ? e.message ?? '安装更新失败，请稍后重试'
               : '安装更新失败，请稍后重试';
@@ -216,7 +232,6 @@ class _AndroidScreenState extends State<AndroidScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _active = true;
-      if (updateInstalling) setState(() => updateInstalling = false);
       unawaited(_loadSnapshot());
     } else {
       _active = false;
@@ -382,6 +397,7 @@ class _AndroidScreenState extends State<AndroidScreen>
             child: Column(
               children: [
                 const Text('蓝牙已关闭，请先开启蓝牙。'),
+                const SizedBox(height: 16),
                 FilledButton(
                   key: const Key('enable-bluetooth'),
                   onPressed: () =>
@@ -423,6 +439,7 @@ class _AndroidScreenState extends State<AndroidScreen>
       if (snapshot.permission && snapshot.bluetoothEnabled) ...[
         Wrap(
           spacing: 8,
+          runSpacing: 8,
           children: [
             for (final label in ['全部', '最近使用', '收藏'])
               ChoiceChip(
@@ -456,6 +473,7 @@ class _AndroidScreenState extends State<AndroidScreen>
                   const Text('没有找到电脑'),
                   const SizedBox(height: 8),
                   const Text('可搜索附近电脑 12 秒；配对确认将由系统显示。'),
+                  const SizedBox(height: 16),
                   FilledButton.icon(
                     key: const Key('discover-empty'),
                     onPressed: snapshot.discovering
@@ -579,9 +597,13 @@ class _AndroidScreenState extends State<AndroidScreen>
                     selected?.a2dpStateKnown == true &&
                     (selected?.a2dpConnected == true ||
                         selected?.a2dpPlaying == true))
-                  const Text(
-                    '媒体服务已连接不等于当前正在向电脑播放。',
-                    textAlign: TextAlign.center,
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text(
+                      '媒体服务已连接不等于当前正在向电脑播放。',
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
                   ),
                 if (selected?.bonded == true &&
                     (snapshot.controlState ==
@@ -642,7 +664,12 @@ class _AndroidScreenState extends State<AndroidScreen>
                               ),
                             ],
                           ),
-                          Text(status.$2, textAlign: TextAlign.center),
+                          const SizedBox(height: 8),
+                          Text(
+                            status.$2,
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
                         ],
                       ),
                     ),
@@ -652,7 +679,7 @@ class _AndroidScreenState extends State<AndroidScreen>
             ),
           ),
         ),
-        const SizedBox(height: 10),
+        const SizedBox(height: 16),
         if (snapshot.outputSwitcherSupported)
           FilledButton.icon(
             key: const Key('output-switcher'),
@@ -690,8 +717,11 @@ class _AndroidScreenState extends State<AndroidScreen>
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Text('快捷入口', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 12),
               Wrap(
                 alignment: WrapAlignment.center,
+                spacing: 8,
+                runSpacing: 8,
                 children: [
                   if (selected != null)
                     TextButton.icon(
@@ -725,6 +755,7 @@ class _AndroidScreenState extends State<AndroidScreen>
             ExpansionTile(
               key: const PageStorageKey('connection-guide'),
               title: const Text('连接指南'),
+              childrenPadding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
               children: [
                 _Step(
                   done: selected?.bonded == true,
@@ -752,16 +783,22 @@ class _AndroidScreenState extends State<AndroidScreen>
               key: const PageStorageKey('troubleshooting'),
               initiallyExpanded: false,
               title: const Text('测试与排障'),
-              childrenPadding: const EdgeInsets.all(12),
+              childrenPadding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
               children: [
                 const Text('4. 播放测试音并由你确认是否听到。'),
+                const SizedBox(height: 16),
                 OutlinedButton.icon(
                   key: const Key('test-tone'),
                   onPressed: busy ? null : _toggleTone,
                   icon: Icon(tone ? Icons.stop : Icons.volume_up),
                   label: Text(tone ? '停止测试音' : '播放 2.5 秒测试音'),
                 ),
-                const Text('测试音自动停止；路由已连接也不代表一定有声音。'),
+                const SizedBox(height: 12),
+                Text(
+                  '测试音自动停止；路由已连接也不代表一定有声音。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 12),
                 TextButton.icon(
                   key: const Key('android-settings'),
                   onPressed: () async {
@@ -775,6 +812,8 @@ class _AndroidScreenState extends State<AndroidScreen>
                   label: const Text('故障时打开系统蓝牙设置'),
                 ),
                 Wrap(
+                  spacing: 12,
+                  runSpacing: 8,
                   children: [
                     TextButton(
                       onPressed: toneStarted
@@ -791,11 +830,20 @@ class _AndroidScreenState extends State<AndroidScreen>
                   ],
                 ),
                 if (heard != null)
-                  Text(heard! ? '已人工确认听到测试音。' : '请检查电脑接收、媒体输出和音量后重试。'),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: Text(heard! ? '已人工确认听到测试音。' : '请检查电脑接收、媒体输出和音量后重试。'),
+                  ),
               ],
             ),
           ],
         ),
+      ),
+      const SizedBox(height: 16),
+      Text(
+        '界面字体：MiSans · 小米',
+        textAlign: TextAlign.center,
+        style: Theme.of(context).textTheme.bodySmall,
       ),
     ];
     return Column(
@@ -813,17 +861,18 @@ class _AndroidScreenState extends State<AndroidScreen>
                   children: [
                     ...[playbackPage, devicePage, settingsPage][_page],
                     if (error != null)
-                      Text(
-                        '操作失败：$error',
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.error,
-                        ),
+                      _PageNotice(
+                        label: '操作失败：$error',
+                        icon: Icons.error_outline,
+                        isError: true,
                       ),
-                    if (info != null) Text(info!, textAlign: TextAlign.center),
+                    if (info != null)
+                      _PageNotice(label: info!, icon: Icons.info_outline),
                     if (snapshot.message.isNotEmpty)
-                      Text(
-                        '电脑消息：${snapshot.message}',
-                        textAlign: TextAlign.center,
+                      _PageNotice(
+                        key: const Key('computer-message'),
+                        label: '电脑消息：${snapshot.message}',
+                        icon: Icons.chat_bubble_outline_rounded,
                       ),
                   ],
                 ),
@@ -881,60 +930,161 @@ class _AndroidScreenState extends State<AndroidScreen>
 
   Widget _updateCard() {
     final update = updateInfo;
+    final progress = downloadProgress;
+    final fraction = progress?.fraction;
     final title = updateChecking
         ? '正在检查更新…'
         : updateInstalling
-        ? '正在准备安装…'
-        : updateError != null
-        ? updateError!
-        : update?.message.isNotEmpty == true
-        ? update!.message
-        : update?.available == true
-        ? '发现新版本 ${update!.latestVersion}'
-        : update == null
-        ? '尚未检查更新'
-        : '当前没有可用的 Android 更新';
+        ? progress?.installing == true
+              ? '下载完成，正在打开安装器…'
+              : progress?.received == 0
+              ? '正在连接下载…'
+              : '正在下载更新…'
+        : updateError ??
+              (update?.message.isNotEmpty == true
+                  ? update!.message
+                  : update?.available == true
+                  ? '发现新版本 ${update!.latestVersion}'
+                  : update == null
+                  ? '尚未检查更新'
+                  : '当前没有可用的 Android 更新');
+    String mb(int bytes) => '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
     return GlassSurface(
       child: Padding(
         padding: const EdgeInsets.all(20),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Icon(Icons.system_update_outlined),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+            Row(
+              children: [
+                const Icon(Icons.system_update_outlined),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    '应用更新',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                ),
+                IconButton(
+                  key: const Key('check-update'),
+                  tooltip: '检查更新',
+                  onPressed: updateChecking || updateInstalling
+                      ? null
+                      : _checkForUpdate,
+                  icon: updateChecking
+                      ? const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.refresh),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(title),
+            if (update != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                '当前版本 ${update.currentVersion}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+            if (updateInstalling) ...[
+              const SizedBox(height: 16),
+              LinearProgressIndicator(
+                key: const Key('update-download-progress'),
+                value: fraction,
+                minHeight: 6,
+                borderRadius: BorderRadius.circular(6),
+                semanticsLabel: '更新下载进度',
+                semanticsValue: fraction == null
+                    ? '已下载 ${mb(progress?.received ?? 0)}'
+                    : '${(fraction * 100).floor()}%',
+              ),
+              const SizedBox(height: 10),
+              Wrap(
+                alignment: WrapAlignment.spaceBetween,
+                spacing: 16,
+                runSpacing: 6,
                 children: [
-                  Text('应用更新', style: Theme.of(context).textTheme.titleMedium),
-                  Text(title),
-                  if (update != null && !update.available)
+                  Text(
+                    fraction == null
+                        ? '已下载 ${mb(progress?.received ?? 0)}'
+                        : '${mb(progress!.received)} / ${mb(progress.total)}',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  if (fraction != null)
                     Text(
-                      '当前版本 ${update.currentVersion}',
-                      style: Theme.of(context).textTheme.bodySmall,
+                      '${(fraction * 100).floor()}%',
+                      style: Theme.of(context).textTheme.labelLarge,
                     ),
                 ],
               ),
-            ),
-            if (update?.available == true)
+            ],
+            if (update?.available == true) ...[
+              const SizedBox(height: 16),
               FilledButton(
                 key: const Key('install-update'),
                 onPressed: updateInstalling || updateChecking
                     ? null
                     : _installUpdate,
-                child: Text(updateInstalling ? '处理中…' : '立即更新'),
-              )
-            else
-              IconButton(
-                key: const Key('check-update'),
-                tooltip: '检查更新',
-                onPressed: updateChecking ? null : _checkForUpdate,
-                icon: updateChecking
-                    ? const SizedBox.square(
-                        dimension: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.refresh),
+                child: Text(
+                  updateInstalling
+                      ? '正在更新…'
+                      : updateError != null
+                      ? '重新下载'
+                      : '立即更新',
+                ),
               ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PageNotice extends StatelessWidget {
+  const _PageNotice({
+    super.key,
+    required this.label,
+    required this.icon,
+    this.isError = false,
+  });
+  final String label;
+  final IconData icon;
+  final bool isError;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = isError ? scheme.error : scheme.onSurfaceVariant;
+    return Padding(
+      padding: const EdgeInsets.only(top: 16),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: (isError ? scheme.error : scheme.primary).withValues(
+            alpha: .06,
+          ),
+          borderRadius: BorderRadius.circular(18),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Icon(icon, size: 18, color: color),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                label,
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: color),
+              ),
+            ),
           ],
         ),
       ),
@@ -1060,16 +1210,21 @@ class _DeviceCardState extends State<_DeviceCard> {
                       device.name,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleSmall,
                     ),
+                    const SizedBox(height: 6),
                     ConnectionStatusLabel(
                       state: indicator,
                       label: label,
                       style: Theme.of(context).textTheme.labelSmall,
                     ),
                     if (device.recent)
-                      Text(
-                        '最近使用',
-                        style: Theme.of(context).textTheme.labelSmall,
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          '最近使用',
+                          style: Theme.of(context).textTheme.labelSmall,
+                        ),
                       ),
                   ],
                 ),
@@ -1100,7 +1255,7 @@ class _Step extends StatelessWidget {
   final String text;
   @override
   Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 5),
+    padding: const EdgeInsets.symmetric(vertical: 8),
     child: Row(
       children: [
         AnimatedSwitcher(

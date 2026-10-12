@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
+<rect width="108" height="108" rx="24" fill="#18483f"/>
+<g transform="translate(54 54) scale(1.35) translate(-54 -54)">
+<path fill="#f2fbf6" d="M 40,33 H 76 Q 81,33 81,38 V 60 Q 81,65 76,65 H 40 Q 35,65 35,60 V 38 Q 35,33 40,33 Z"/>
+<path fill="#18483f" d="M 41,37 H 75 Q 77,37 77,39 V 58 Q 77,60 75,60 H 41 Q 39,60 39,58 V 39 Q 39,37 41,37 Z"/>
+<path fill="#f2fbf6" d="M 55,64 H 60 Q 61,64 61,65 V 70 Q 61,71 60,71 H 55 Q 54,71 54,70 V 65 Q 54,64 55,64 Z"/>
+<path fill="#f2fbf6" d="M 47,70 H 68 Q 70,70 70,72 V 72 Q 70,74 68,74 H 47 Q 45,74 45,72 V 72 Q 45,70 47,70 Z"/>
+<path fill="none" stroke="#8ee8c2" stroke-width="3" stroke-linecap="round" d="M 47,47 L 47,51"/>
+<path fill="none" stroke="#8ee8c2" stroke-width="3" stroke-linecap="round" d="M 54,43 L 54,55"/>
+<path fill="none" stroke="#8ee8c2" stroke-width="3" stroke-linecap="round" d="M 61,45 L 61,53"/>
+<path fill="none" stroke="#8ee8c2" stroke-width="3" stroke-linecap="round" d="M 68,48 L 68,50"/>
+<path fill="#18483f" d="M 30,44 H 40 Q 46,44 46,50 V 74 Q 46,80 40,80 H 30 Q 24,80 24,74 V 50 Q 24,44 30,44 Z"/>
+<path fill="#f2fbf6" d="M 31,47 H 39 Q 43,47 43,51 V 73 Q 43,77 39,77 H 31 Q 27,77 27,73 V 51 Q 27,47 31,47 Z"/>
+<path fill="#18483f" d="M 31,51 H 39 Q 40,51 40,52 V 68 Q 40,69 39,69 H 31 Q 30,69 30,68 V 52 Q 30,51 31,51 Z"/>
+<path fill="none" stroke="#18483f" stroke-width="2" stroke-linecap="round" d="M 33,73 L 37,73"/>
+</g></svg>

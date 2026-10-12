@@ -618,6 +618,10 @@ class _WindowsContent extends StatelessWidget {
                 padding: EdgeInsets.all(16),
                 child: Text('关闭窗口时可按提示保留托盘接收。遇到问题请检查 Windows 蓝牙设置和配对状态。'),
               ),
+              Padding(
+                padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
+                child: Text('界面字体：MiSans · 小米'),
+              ),
             ],
           ),
         ],

@@ -10,17 +10,24 @@ import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import org.json.JSONArray
 import android.os.Build
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : FlutterActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var testTone: ToneGenerator? = null
     private var releaseToneRunnable: Runnable? = null
     private lateinit var companionController: CompanionController
+    private val downloading = AtomicBoolean(false)
+    @Volatile private var destroyed = false
+    @Volatile private var updateConnection: HttpURLConnection? = null
+    private var progressSink: EventChannel.EventSink? = null
+    private var lastProgress: Map<String, Any>? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -83,6 +90,14 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "${UPDATE_CHANNEL}_progress")
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink) {
+                    progressSink = events
+                    lastProgress?.let(events::success)
+                }
+                override fun onCancel(arguments: Any?) { progressSink = null }
+            })
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, UPDATE_CHANNEL)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -92,7 +107,7 @@ class MainActivity : FlutterActivity() {
                         if (url.isNullOrBlank()) {
                             result.error("invalid_argument", "update URL is required", null)
                         } else {
-                            downloadAndInstall(url, result)
+                            downloadAndInstall(url, call.argument<String>("requestId") ?: "", result)
                         }
                     }
                     else -> result.notImplemented()
@@ -112,6 +127,9 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        destroyed = true
+        updateConnection?.disconnect()
+        progressSink = null
         if (::companionController.isInitialized) companionController.destroy()
         super.onDestroy()
     }
@@ -206,26 +224,55 @@ class MainActivity : FlutterActivity() {
         }.start()
     }
 
-    private fun downloadAndInstall(url: String, result: MethodChannel.Result) {
+    private fun reportDownload(requestId: String, received: Long, total: Long, stage: String) {
+        mainHandler.post {
+            if (!destroyed) {
+                val event = mapOf("requestId" to requestId, "received" to received,
+                    "total" to total, "stage" to stage)
+                lastProgress = event
+                progressSink?.success(event)
+            }
+        }
+    }
+
+    private fun downloadAndInstall(url: String, requestId: String, result: MethodChannel.Result) {
+        if (!downloading.compareAndSet(false, true)) {
+            result.error("update_busy", "正在下载更新，请稍候", null)
+            return
+        }
+        reportDownload(requestId, 0, 0, "connecting")
         Thread {
+            val updateDirectory = File(cacheDir, "updates")
+            val partial = File(updateDirectory, "$APK_ASSET_NAME.${System.nanoTime()}.part")
             try {
-                val updateDirectory = File(cacheDir, "updates").apply { mkdirs() }
+                updateDirectory.mkdirs()
                 val apk = File(updateDirectory, APK_ASSET_NAME)
                 val connection = URL(url).openConnection() as HttpURLConnection
+                updateConnection = connection
                 connection.connectTimeout = NETWORK_TIMEOUT_MS
                 connection.readTimeout = NETWORK_TIMEOUT_MS
                 connection.requestMethod = "GET"
                 connection.setRequestProperty("User-Agent", "AudioShare/${currentVersionName()}")
+                connection.setRequestProperty("Accept-Encoding", "identity")
                 try {
                     if (connection.responseCode !in 200..299) {
                         throw IllegalStateException("APK 下载失败：HTTP ${connection.responseCode}")
                     }
+                    val total = connection.contentLengthLong.coerceAtLeast(0)
                     connection.inputStream.use { input ->
-                        apk.outputStream().use { output -> input.copyTo(output) }
+                        partial.outputStream().use { output ->
+                            copyUpdate(input, output, total, cancelled = { destroyed }) { received, size ->
+                                reportDownload(requestId, received, size, "downloading")
+                            }
+                        }
                     }
                 } finally {
                     connection.disconnect()
+                    updateConnection = null
                 }
+                if (destroyed) throw java.io.IOException("下载已取消")
+                if (!partial.renameTo(apk)) throw java.io.IOException("无法保存安装包，请重试")
+                reportDownload(requestId, apk.length(), apk.length(), "installing")
                 val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", apk)
                 val intent = Intent(Intent.ACTION_VIEW).apply {
                     setDataAndType(uri, "application/vnd.android.package-archive")
@@ -233,6 +280,8 @@ class MainActivity : FlutterActivity() {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 mainHandler.post {
+                    downloading.set(false)
+                    if (destroyed) return@post
                     try {
                         startActivity(intent)
                         result.success(null)
@@ -241,7 +290,10 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             } catch (exception: Exception) {
+                partial.delete()
                 mainHandler.post {
+                    downloading.set(false)
+                    if (destroyed) return@post
                     result.error(
                         "update_install_failed",
                         exception.message ?: "下载或安装更新失败",
