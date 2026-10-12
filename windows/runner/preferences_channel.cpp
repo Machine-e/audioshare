@@ -41,11 +41,12 @@ std::string ToUtf8(const std::wstring& value) {
 }
 }  // namespace
 
-std::function<void()> RegisterPreferencesChannel(flutter::BinaryMessenger* messenger) {
+std::function<void()> RegisterPreferencesChannel(flutter::BinaryMessenger* messenger,
+                                               std::function<void()> appearance_changed) {
   auto channel = std::make_shared<flutter::MethodChannel<EncodableValue>>(
       messenger, kChannelName, &flutter::StandardMethodCodec::GetInstance());
   channel->SetMethodCallHandler(
-      [](const flutter::MethodCall<EncodableValue>& call,
+      [appearance_changed](const flutter::MethodCall<EncodableValue>& call,
          std::unique_ptr<flutter::MethodResult<EncodableValue>> result) {
         if (call.method_name() == "readThemeMode") {
           wchar_t value[16]{};
@@ -72,7 +73,10 @@ std::function<void()> RegisterPreferencesChannel(flutter::BinaryMessenger* messe
           const auto status = RegSetKeyValueW(HKEY_CURRENT_USER, kRegistryPath,
               L"theme mode", REG_SZ, wide.c_str(),
               static_cast<DWORD>((wide.size() + 1) * sizeof(wchar_t)));
-          if (status == ERROR_SUCCESS) result->Success();
+          if (status == ERROR_SUCCESS) {
+            appearance_changed();
+            result->Success();
+          }
           else result->Error("preference_write_failed", "Could not save appearance.");
           return;
         }

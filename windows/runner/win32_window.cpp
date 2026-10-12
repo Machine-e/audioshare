@@ -214,8 +214,10 @@ Win32Window::MessageHandler(HWND hwnd,
       return 0;
 
     case WM_DWMCOLORIZATIONCOLORCHANGED:
+    case WM_THEMECHANGED:
+    case WM_SETTINGCHANGE:
       UpdateTheme(hwnd);
-      return 0;
+      break;
   }
 
   return DefWindowProc(window_handle_, message, wparam, lparam);
@@ -273,16 +275,39 @@ void Win32Window::OnDestroy() {
 }
 
 void Win32Window::UpdateTheme(HWND const window) {
-  DWORD light_mode;
+  DWORD light_mode = 1;
   DWORD light_mode_size = sizeof(light_mode);
-  LSTATUS result = RegGetValue(HKEY_CURRENT_USER, kGetPreferredBrightnessRegKey,
+  RegGetValue(HKEY_CURRENT_USER, kGetPreferredBrightnessRegKey,
                                kGetPreferredBrightnessRegValue,
                                RRF_RT_REG_DWORD, nullptr, &light_mode,
                                &light_mode_size);
 
-  if (result == ERROR_SUCCESS) {
-    BOOL enable_dark_mode = light_mode == 0;
-    DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                          &enable_dark_mode, sizeof(enable_dark_mode));
-  }
+  wchar_t preference[16]{};
+  DWORD bytes = sizeof(preference);
+  RegGetValueW(HKEY_CURRENT_USER, L"Software\\AudioShare", L"theme mode",
+               RRF_RT_REG_SZ, nullptr, preference, &bytes);
+  BOOL dark = light_mode == 0;
+  if (wcscmp(preference, L"light") == 0) dark = FALSE;
+  if (wcscmp(preference, L"dark") == 0) dark = TRUE;
+
+  HIGHCONTRASTW contrast{sizeof(HIGHCONTRASTW)};
+  SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0);
+  const bool high_contrast = (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+  const BOOL dark_caption = dark && !high_contrast;
+  DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                        &dark_caption, sizeof(dark_caption));
+  // DWM caption colors are supported on Windows 11; older builds keep their
+  // native light/dark frame. Keep resize, system menu and Snap Layouts intact.
+  const COLORREF background = high_contrast ? 0xffffffff :
+      dark ? RGB(30, 53, 48) : RGB(226, 238, 233);
+  const COLORREF foreground = high_contrast ? 0xffffffff :
+      dark ? RGB(226, 237, 232) : RGB(28, 43, 38);
+  DwmSetWindowAttribute(window, 34 /* DWMWA_BORDER_COLOR */, &background, sizeof(background));
+  DwmSetWindowAttribute(window, 35 /* DWMWA_CAPTION_COLOR */, &background, sizeof(background));
+  DwmSetWindowAttribute(window, 36 /* DWMWA_TEXT_COLOR */, &foreground, sizeof(foreground));
+  RedrawWindow(window, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
+}
+
+void Win32Window::RefreshTheme() {
+  if (window_handle_) UpdateTheme(window_handle_);
 }

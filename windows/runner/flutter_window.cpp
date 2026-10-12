@@ -43,7 +43,8 @@ bool FlutterWindow::OnCreate() {
   external_route_channel_cleanup_ =
       RegisterExternalRouteChannel(flutter_controller_->engine()->messenger());
   preferences_channel_cleanup_ =
-      RegisterPreferencesChannel(flutter_controller_->engine()->messenger());
+      RegisterPreferencesChannel(flutter_controller_->engine()->messenger(),
+                                 [this]() { RefreshTheme(); });
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   taskbar_created_message_ = RegisterWindowMessageW(L"TaskbarCreated");

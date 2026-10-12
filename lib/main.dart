@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'android_screen.dart';
 import 'app_style.dart';
+import 'windows_receive_volume.dart';
 import 'platform/android_update_bridge.dart';
 import 'platform/companion_bridge.dart';
 import 'platform/external_route_bridge.dart';
@@ -604,6 +605,11 @@ class _WindowsContent extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           _StatusServiceCard(controller.bridge),
+          const SizedBox(height: 16),
+          WindowsReceiveVolume(
+            bridge: controller.bridge,
+            connected: controller.phase == SinkPhase.opened,
+          ),
           const SizedBox(height: 16),
           const ExpansionTile(
             title: Text('使用帮助'),

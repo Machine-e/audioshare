@@ -3,6 +3,7 @@
 #include "sink_state_machine.h"
 #include "sink_open_retry.h"
 #include "connection_trace.h"
+#include "receive_volume.h"
 
 #include <flutter/encodable_value.h>
 #include <flutter/method_channel.h>
@@ -107,6 +108,7 @@ struct BluetoothState {
   uint64_t generation = 0;
   audioshare::SinkStateMachine reducer;
   bool shutting_down = false;
+  std::shared_ptr<audioshare::ReceiveVolume> volume = std::make_shared<audioshare::ReceiveVolume>();
 };
 struct BluetoothResources {
   AudioPlaybackConnection connection{nullptr};
@@ -115,6 +117,7 @@ struct BluetoothResources {
   IAsyncInfo pending_operation{nullptr};
   std::unique_ptr<MethodResult> waiter;
   uint64_t generation = 0;
+  std::shared_ptr<audioshare::ReceiveVolume> volume;
 };
 
 EncodableValue Status(const std::string& mode, const std::string& message) {
@@ -130,6 +133,7 @@ BluetoothResources ResetState(const std::shared_ptr<BluetoothState>& state,
   BluetoothResources out{state->connection, state->state_changed_token,
                          state->has_state_changed_token, state->pending_operation,
                          std::move(state->waiter), ++state->generation};
+  out.volume = state->volume;
   state->connection = nullptr;
   state->has_state_changed_token = false;
   state->device_id.clear();
@@ -141,6 +145,7 @@ BluetoothResources ResetState(const std::shared_ptr<BluetoothState>& state,
   return out;
 }
 void CloseResources(BluetoothResources resources, bool complete_waiter = true) {
+  if (resources.volume) resources.volume->Restore();
   if (resources.pending_operation) try { resources.pending_operation.Cancel(); } catch (...) {}
   if (resources.connection && resources.has_token)
     try { resources.connection.StateChanged(resources.token); } catch (...) {}
@@ -265,6 +270,7 @@ bool TakeConnection(const std::shared_ptr<BluetoothState>& state,
   resources = {state->connection, state->state_changed_token,
                state->has_state_changed_token, state->pending_operation,
                std::move(state->waiter), state->generation};
+  resources.volume = state->volume;
   state->connection = nullptr;
   state->has_state_changed_token = false;
   state->device_id.clear();
@@ -415,6 +421,75 @@ std::function<void()> RegisterExternalRouteChannel(flutter::BinaryMessenger* mes
       [state, executor, status_server](const flutter::MethodCall<EncodableValue>& call,
                         std::unique_ptr<MethodResult> result) {
     const auto& method = call.method_name();
+    if (method == "getReceiveVolume" || method == "setReceiveVolume") {
+      int value = -1;
+      if (method == "setReceiveVolume") {
+        const auto* args = call.arguments();
+        if (args && std::holds_alternative<EncodableMap>(*args)) {
+          const auto& map = std::get<EncodableMap>(*args);
+          const auto it = map.find(EncodableValue("value"));
+          if (it != map.end() && std::holds_alternative<int32_t>(it->second))
+            value = std::get<int32_t>(it->second);
+        }
+        if (value < 0 || value > 100) {
+          result->Error("invalid_volume", "音量必须在 0–100 之间。"); return;
+        }
+      }
+      uint64_t generation;
+      winrt::hstring device_id;
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        generation = state->generation;
+        device_id = state->device_id;
+      }
+      executor->Post([state, generation, device_id, value, result = std::move(result)]() mutable {
+        auto reply = [&](bool available, const char* message) {
+          result->Success(EncodableValue(EncodableMap{
+            {EncodableValue("available"), EncodableValue(available)},
+            {EncodableValue("current"), EncodableValue(state->volume->value())},
+            {EncodableValue("max"), EncodableValue(100)},
+            {EncodableValue("fixed"), EncodableValue(!available)},
+            {EncodableValue("message"), EncodableValue(message)}}));
+        };
+        try {
+          if (device_id.empty() || !Current(state, generation)) {
+            reply(false, "请先连接手机并开始播放，再刷新音量。"); return;
+          }
+          if (value < 0) {
+            auto operation = DeviceInformation::FindAllAsync(AudioPlaybackConnection::GetDeviceSelector());
+            if (operation.wait_for(std::chrono::seconds(3)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
+              operation.Cancel(); reply(false, "设备查询超时，请刷新重试。"); return;
+            }
+            const auto devices = operation.get();
+            std::wstring name;
+            for (const auto& device : devices) if (device.Id() == device_id) name = device.Name().c_str();
+            int names = 0;
+            for (const auto& device : devices) if (device.Name() == name) ++names;
+            if (name.empty() || names != 1 || !Current(state, generation)) {
+              reply(false, "无法唯一识别手机的接收会话。"); return;
+            }
+            if (!state->volume->Locate(name)) {
+              reply(false, "未找到独立接收声道。请播放手机音频后刷新。"); return;
+            }
+          } else if (!state->volume->Validate()) {
+            reply(false, "接收声道已变化，请刷新音量。"); return;
+          }
+          {
+            // Stop/device changes cannot slip between validating and writing.
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->shutting_down || state->generation != generation ||
+                state->device_id != device_id || state->reducer.state() != audioshare::SinkState::opened) {
+              reply(false, "连接已变化，请重新连接后刷新。"); return;
+            }
+            if (value >= 0) state->volume->Set(value);
+          }
+          reply(true, "仅调节电脑接收声道；100% 为原始音量。");
+        } catch (...) {
+          reply(false, "接收声道暂不可用，请刷新重试。");
+        }
+      });
+      return;
+    }
     if (method == "listBluetoothDevices") {
       const uint64_t generation = [&] { std::lock_guard<std::mutex> l(state->mutex); return state->generation; }();
       executor->Post([state, generation, result = std::move(result)]() mutable {

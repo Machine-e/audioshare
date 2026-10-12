@@ -81,6 +81,16 @@ class ExternalRouteBridge {
         as Map<dynamic, dynamic>,
   );
 
+  Future<MediaVolume> getReceiveVolume() async => MediaVolume.fromMap(
+    (await _channel.invokeMethod<dynamic>('getReceiveVolume'))
+        as Map<dynamic, dynamic>,
+  );
+
+  Future<MediaVolume> setReceiveVolume(int value) async => MediaVolume.fromMap(
+    (await _channel.invokeMethod<dynamic>('setReceiveVolume', {'value': value}))
+        as Map<dynamic, dynamic>,
+  );
+
   Future<MediaVolume> setMediaVolume(int value) async => MediaVolume.fromMap(
     (await _channel.invokeMethod<dynamic>('setMediaVolume', {'value': value}))
         as Map<dynamic, dynamic>,
