@@ -8,7 +8,9 @@ if (-not (Test-Path $flutter)) {
 $env:FLUTTER_STORAGE_BASE_URL = "https://storage.flutter-io.cn"
 
 & $flutter pub get
+if ($LASTEXITCODE -ne 0) { throw "flutter pub get failed" }
 & $flutter build apk --release
+if ($LASTEXITCODE -ne 0) { throw "Android release build failed" }
 
 $dist = Join-Path $PSScriptRoot "..\dist"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null

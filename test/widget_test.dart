@@ -330,17 +330,21 @@ void main() {
       ),
     );
     await tester.pump();
+    await tester.tap(find.byKey(const Key('nav-settings')));
+    await tester.pumpAndSettle();
     await tester.ensureVisible(find.text('连接指南'));
     await tester.tap(find.text('连接指南'));
     await tester.pumpAndSettle();
     expect(find.text('1. 与 Windows 电脑完成蓝牙配对。'), findsOneWidget);
     expect(find.text('2. 在电脑端选择手机并开启接收。'), findsOneWidget);
     expect(find.text('3. 在手机媒体输出中选择这台电脑。'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('nav-settings')));
+    await tester.pumpAndSettle();
     await tester.ensureVisible(find.text('测试与排障'));
     await tester.tap(find.text('测试与排障'));
     await tester.pumpAndSettle();
     expect(find.text('4. 播放测试音并由你确认是否听到。'), findsOneWidget);
-    expect(find.byKey(const Key('media-volume-slider')), findsOneWidget);
+    expect(find.byKey(const Key('media-volume-slider')), findsNothing);
     expect(find.byKey(const Key('android-settings')), findsOneWidget);
     expect(find.byIcon(Icons.settings_bluetooth), findsOneWidget);
   });
@@ -402,6 +406,8 @@ void main() {
       expect(find.textContaining('read failed'), findsOneWidget);
 
       bridge.volumeReadError = null;
+      await tester.tap(find.byKey(const Key('nav-settings')));
+      await tester.pumpAndSettle();
       await tester.ensureVisible(find.text('测试与排障'));
       await tester.tap(find.text('测试与排障'));
       await tester.pumpAndSettle();

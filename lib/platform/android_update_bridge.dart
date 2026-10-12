@@ -6,12 +6,14 @@ class AndroidUpdateInfo {
     required this.currentVersion,
     required this.latestVersion,
     required this.downloadUrl,
+    this.message = '',
   });
 
   final bool available;
   final String currentVersion;
   final String latestVersion;
   final String downloadUrl;
+  final String message;
 
   factory AndroidUpdateInfo.fromMap(Map<Object?, Object?> map) {
     return AndroidUpdateInfo(
@@ -19,6 +21,7 @@ class AndroidUpdateInfo {
       currentVersion: map['currentVersion'] as String? ?? '',
       latestVersion: map['latestVersion'] as String? ?? '',
       downloadUrl: map['downloadUrl'] as String? ?? '',
+      message: map['message'] as String? ?? '',
     );
   }
 }

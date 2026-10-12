@@ -97,11 +97,7 @@ void main() {
         await tester.tap(find.byKey(const Key('start-button')));
         await tester.pumpAndSettle();
       }
-      await tester.tap(find.byKey(const Key('theme-menu')));
-      await tester.pumpAndSettle();
-      await tester.tap(
-        find.widgetWithText(CheckedPopupMenuItem<ThemeMode>, '暗色'),
-      );
+      await tester.tap(find.byKey(const Key('theme-toggle')));
       await tester.pumpAndSettle();
       expect(bridge.appearance, 'dark');
       expect(
@@ -120,11 +116,7 @@ void main() {
         tester.widget<MaterialApp>(find.byType(MaterialApp)).themeMode,
         ThemeMode.dark,
       );
-      await tester.tap(find.byKey(const Key('theme-menu')));
-      await tester.pumpAndSettle();
-      await tester.tap(
-        find.widgetWithText(CheckedPopupMenuItem<ThemeMode>, '亮色'),
-      );
+      await tester.tap(find.byKey(const Key('theme-toggle')));
       await tester.pumpAndSettle();
       expect(bridge.appearance, 'light');
     });
@@ -138,11 +130,7 @@ void main() {
       AudioShareApp(platform: TargetPlatform.windows, bridge: bridge),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const Key('theme-menu')));
-    await tester.pumpAndSettle();
-    await tester.tap(
-      find.widgetWithText(CheckedPopupMenuItem<ThemeMode>, '暗色'),
-    );
+    await tester.tap(find.byKey(const Key('theme-toggle')));
     await tester.pumpAndSettle();
     bridge.pendingTheme!.complete('light');
     await tester.pumpAndSettle();
@@ -150,5 +138,32 @@ void main() {
       tester.widget<MaterialApp>(find.byType(MaterialApp)).themeMode,
       ThemeMode.dark,
     );
+  });
+
+  testWidgets('theme toggle follows system brightness and reverses mid-fade', (
+    tester,
+  ) async {
+    tester.platformDispatcher.platformBrightnessTestValue = Brightness.dark;
+    addTearDown(tester.platformDispatcher.clearPlatformBrightnessTestValue);
+    final bridge = AppearanceBridge();
+    await tester.pumpWidget(
+      AudioShareApp(platform: TargetPlatform.windows, bridge: bridge),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('切换到亮色'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('theme-toggle')));
+    await tester.pump();
+    expect(bridge.appearance, 'light');
+    // Tap again while the rendered theme is still dark. The selected target
+    // must drive the next toggle, otherwise both taps would request light.
+    await tester.pump(const Duration(milliseconds: 30));
+    await tester.tap(find.byKey(const Key('theme-toggle')));
+    await tester.pumpAndSettle();
+    expect(bridge.appearance, 'dark');
+    expect(
+      tester.widget<MaterialApp>(find.byType(MaterialApp)).themeMode,
+      ThemeMode.dark,
+    );
+    expect(bridge.stops, 0);
   });
 }

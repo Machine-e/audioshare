@@ -328,6 +328,8 @@ void main() {
     );
     await pumpAndroid(tester, companion);
     await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('nav-devices')));
+    await tester.pumpAndSettle();
     companion.controller.add(
       const CompanionSnapshot(
         revision: 1,
@@ -382,6 +384,8 @@ void main() {
         ),
       );
       await tester.pump();
+      await tester.tap(find.byKey(const Key('nav-devices')));
+      await tester.pumpAndSettle();
       expect(find.text('没有找到电脑'), findsOneWidget);
       await tester.tap(find.byKey(const Key('discover-empty')));
       await tester.pump();
@@ -401,6 +405,8 @@ void main() {
       ),
     );
     await pumpAndroid(tester, companion, route: route);
+    await tester.tap(find.byKey(const Key('nav-devices')));
+    await tester.pumpAndSettle();
     expect(find.text('Alpha PC'), findsOneWidget);
     expect(find.text('Beta PC'), findsOneWidget);
     await tester.tap(find.byKey(const Key('device-alpha')));
@@ -499,6 +505,8 @@ void main() {
         ),
       );
       await pumpAndroid(tester, companion);
+      await tester.tap(find.byKey(const Key('nav-settings')));
+      await tester.pumpAndSettle();
       await tester.ensureVisible(find.byKey(const Key('pin-shortcut')));
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('pin-shortcut')));

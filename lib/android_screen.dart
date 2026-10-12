@@ -2,6 +2,7 @@ import 'app_style.dart';
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'platform/companion_bridge.dart';
 import 'platform/android_update_bridge.dart';
@@ -34,18 +35,19 @@ class _AndroidScreenState extends State<AndroidScreen>
   String? error;
   String? info;
   AndroidUpdateInfo? updateInfo;
+  String? updateError;
   bool updateChecking = false, updateInstalling = false;
   bool volumeLoading = true,
       busy = false,
       tone = false,
       toneStarted = false,
-      statusRetrying = false,
-      entered = false;
+      statusRetrying = false;
   int _volumeEpoch = 0;
   int volumeRefreshes = 0;
   int statusRefreshes = 0;
   int _lastRevision = -1;
   String _deviceFilter = '全部';
+  int _page = 0;
   bool _active = true;
   bool? heard;
   StreamSubscription<CompanionSnapshot>? subscription;
@@ -69,9 +71,6 @@ class _AndroidScreenState extends State<AndroidScreen>
     unawaited(_loadSnapshot());
     unawaited(_refreshVolume());
     if (widget.updateBridge != null) unawaited(_checkForUpdate());
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) setState(() => entered = true);
-    });
   }
 
   void _apply(CompanionSnapshot value) {
@@ -233,17 +232,26 @@ class _AndroidScreenState extends State<AndroidScreen>
     if (widget.updateBridge == null || updateChecking || updateInstalling) {
       return;
     }
-    setState(() => updateChecking = true);
+    setState(() {
+      updateChecking = true;
+      updateError = null;
+    });
     try {
       final result = await widget.updateBridge!.checkForUpdate();
       if (mounted) {
         setState(() {
           updateInfo = result;
-          error = null;
+          updateError = null;
         });
       }
     } catch (e) {
-      if (mounted) setState(() => error = '检查更新失败：$e');
+      if (mounted) {
+        setState(
+          () => updateError = e is PlatformException
+              ? e.message ?? '检查更新失败，请稍后重试'
+              : '检查更新失败，请稍后重试',
+        );
+      }
     } finally {
       if (mounted) setState(() => updateChecking = false);
     }
@@ -254,7 +262,7 @@ class _AndroidScreenState extends State<AndroidScreen>
     if (update == null || !update.available || updateInstalling) return;
     setState(() {
       updateInstalling = true;
-      error = null;
+      updateError = null;
       info = '正在下载更新，完成后会打开系统安装器…';
     });
     try {
@@ -263,7 +271,9 @@ class _AndroidScreenState extends State<AndroidScreen>
       if (mounted) {
         setState(() {
           updateInstalling = false;
-          error = '安装更新失败：$e';
+          updateError = e is PlatformException
+              ? e.message ?? '安装更新失败，请稍后重试'
+              : '安装更新失败，请稍后重试';
           info = null;
         });
       }
@@ -274,6 +284,7 @@ class _AndroidScreenState extends State<AndroidScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _active = true;
+      if (updateInstalling) setState(() => updateInstalling = false);
       unawaited(_refreshVolume());
       unawaited(_loadSnapshot());
     } else {
@@ -385,362 +396,371 @@ class _AndroidScreenState extends State<AndroidScreen>
         ? '蓝牙媒体已连接'
         : selected == null
         ? '请选择一台电脑'
+        : selected.a2dpStateKnown && !selected.bonding
+        ? '蓝牙媒体已断开'
         : '尚未确认蓝牙媒体连接';
-    return AnimatedSlide(
-      key: const Key('page-entrance-slide'),
-      offset: entered ? Offset.zero : const Offset(0, .025),
-      duration: _motionDuration(context),
-      curve: Curves.easeOutCubic,
-      child: AnimatedOpacity(
-        key: const Key('page-entrance-opacity'),
-        opacity: entered ? 1 : 0,
-        duration: _motionDuration(context),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
+    final mediaState = localConnected || openedForThisPhone
+        ? ConnectionIndicatorState.connected
+        : selected?.bonding == true
+        ? ConnectionIndicatorState.pending
+        : selected?.a2dpStateKnown == true
+        ? ConnectionIndicatorState.disconnected
+        : ConnectionIndicatorState.unknown;
+    final receiverState =
+        snapshot.controlState == CompanionControlState.connecting
+        ? ConnectionIndicatorState.pending
+        : snapshot.controlState != CompanionControlState.connected ||
+              snapshot.receiverTarget != ReceiverTarget.thisPhone
+        ? ConnectionIndicatorState.unknown
+        : switch (snapshot.receiverMode) {
+            'opened' => ConnectionIndicatorState.connected,
+            'error' ||
+            'disconnected' ||
+            'stopped' => ConnectionIndicatorState.disconnected,
+            'starting' || 'waitingForRoute' => ConnectionIndicatorState.pending,
+            _ => ConnectionIndicatorState.unknown,
+          };
+    final accessPrompt = <Widget>[
+      if (!snapshot.permission)
+        GlassSurface(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
               children: [
-                Expanded(
-                  child: Text(
-                    '我的电脑',
-                    style: Theme.of(context).textTheme.headlineMedium,
-                  ),
+                const Icon(Icons.bluetooth_searching, size: 54),
+                const SizedBox(height: 8),
+                const Text(
+                  '读取附近电脑需要蓝牙权限，仅用于发现、配对和连接，不会采集音频。',
+                  textAlign: TextAlign.center,
                 ),
-                IconButton(
-                  key: const Key('discover'),
-                  tooltip: snapshot.discovering ? '停止搜索' : '搜索新电脑',
-                  onPressed: !snapshot.permission || !snapshot.bluetoothEnabled
-                      ? () => _companion(widget.companionBridge.requestAccess())
-                      : () => _companion(
-                          snapshot.discovering
-                              ? widget.companionBridge.stopDiscovery()
-                              : widget.companionBridge.startDiscovery(),
-                        ),
-                  icon: Icon(
-                    snapshot.discovering
-                        ? Icons.stop_circle_outlined
-                        : Icons.add,
-                  ),
+                const SizedBox(height: 12),
+                FilledButton(
+                  key: const Key('request-access'),
+                  onPressed: () =>
+                      _companion(widget.companionBridge.requestAccess()),
+                  child: const Text('读取附近设备'),
                 ),
               ],
             ),
-            const SizedBox(height: 12),
-            if (!snapshot.permission)
-              GlassSurface(
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    children: [
-                      const Icon(Icons.bluetooth_searching, size: 54),
-                      const SizedBox(height: 8),
-                      const Text(
-                        '读取附近电脑需要蓝牙权限，仅用于发现、配对和连接，不会采集音频。',
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 12),
-                      FilledButton(
-                        key: const Key('request-access'),
-                        onPressed: () =>
-                            _companion(widget.companionBridge.requestAccess()),
-                        child: const Text('读取附近设备'),
-                      ),
-                    ],
-                  ),
+          ),
+        )
+      else if (!snapshot.bluetoothEnabled)
+        GlassSurface(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              children: [
+                const Text('蓝牙已关闭，请先开启蓝牙。'),
+                FilledButton(
+                  key: const Key('enable-bluetooth'),
+                  onPressed: () =>
+                      _companion(widget.companionBridge.requestAccess()),
+                  child: const Text('开启蓝牙'),
                 ),
-              )
-            else if (!snapshot.bluetoothEnabled)
-              GlassSurface(
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    children: [
-                      const Text('蓝牙已关闭，请先开启蓝牙。'),
-                      FilledButton(
-                        key: const Key('enable-bluetooth'),
-                        onPressed: () =>
-                            _companion(widget.companionBridge.requestAccess()),
-                        child: const Text('开启蓝牙'),
-                      ),
-                    ],
+              ],
+            ),
+          ),
+        ),
+    ];
+    final devicePage = <Widget>[
+      Row(
+        children: [
+          Expanded(
+            child: Text(
+              '我的电脑',
+              style: Theme.of(context).textTheme.headlineMedium,
+            ),
+          ),
+          IconButton(
+            key: const Key('discover'),
+            tooltip: snapshot.discovering ? '停止搜索' : '搜索新电脑',
+            onPressed: !snapshot.permission || !snapshot.bluetoothEnabled
+                ? () => _companion(widget.companionBridge.requestAccess())
+                : () => _companion(
+                    snapshot.discovering
+                        ? widget.companionBridge.stopDiscovery()
+                        : widget.companionBridge.startDiscovery(),
                   ),
-                ),
-              )
-            else ...[
-              Wrap(
-                spacing: 8,
+            icon: Icon(
+              snapshot.discovering ? Icons.stop_circle_outlined : Icons.add,
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 12),
+      ...accessPrompt,
+      if (snapshot.permission && snapshot.bluetoothEnabled) ...[
+        Wrap(
+          spacing: 8,
+          children: [
+            for (final label in ['全部', '最近使用', '收藏'])
+              ChoiceChip(
+                label: Text(label),
+                selected: _deviceFilter == label,
+                onSelected: (_) => setState(() => _deviceFilter = label),
+              ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        if (snapshot.discovering) ...[
+          const Text('正在搜索附近电脑，12 秒后自动停止'),
+          const SizedBox(height: 8),
+          TweenAnimationBuilder<double>(
+            key: const Key('scan-progress'),
+            tween: Tween(begin: 0, end: 1),
+            duration: MediaQuery.disableAnimationsOf(context)
+                ? Duration.zero
+                : const Duration(seconds: 12),
+            builder: (context, elapsed, _) =>
+                LinearProgressIndicator(value: elapsed),
+          ),
+          const SizedBox(height: 12),
+        ],
+        if (snapshot.devices.isEmpty)
+          GlassSurface(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
                 children: [
-                  for (final label in ['全部', '最近使用', '收藏'])
-                    ChoiceChip(
-                      label: Text(label),
-                      selected: _deviceFilter == label,
-                      onSelected: (_) => setState(() => _deviceFilter = label),
-                    ),
+                  const Text('没有找到电脑'),
+                  const SizedBox(height: 8),
+                  const Text('可搜索附近电脑 12 秒；配对确认将由系统显示。'),
+                  FilledButton.icon(
+                    key: const Key('discover-empty'),
+                    onPressed: snapshot.discovering
+                        ? null
+                        : () {
+                            _companion(widget.companionBridge.startDiscovery());
+                            discoveryTimer?.cancel();
+                            discoveryTimer = Timer(
+                              const Duration(seconds: 12),
+                              () => _companion(
+                                widget.companionBridge.stopDiscovery(),
+                              ),
+                            );
+                          },
+                    icon: const Icon(Icons.search),
+                    label: Text(snapshot.discovering ? '正在搜索…' : '搜索附近设备'),
+                  ),
                 ],
               ),
-              const SizedBox(height: 12),
-              if (snapshot.discovering) ...[
-                const Text('正在搜索附近电脑，12 秒后自动停止'),
-                const SizedBox(height: 8),
-                TweenAnimationBuilder<double>(
-                  key: const Key('scan-progress'),
-                  tween: Tween(begin: 0, end: 1),
-                  duration: MediaQuery.disableAnimationsOf(context)
-                      ? Duration.zero
-                      : const Duration(seconds: 12),
-                  builder: (context, elapsed, _) =>
-                      LinearProgressIndicator(value: elapsed),
-                ),
-                const SizedBox(height: 12),
-              ],
-              if (snapshot.devices.isEmpty)
-                GlassSurface(
-                  child: Padding(
-                    padding: const EdgeInsets.all(20),
-                    child: Column(
-                      children: [
-                        const Text('没有找到电脑'),
-                        const SizedBox(height: 8),
-                        const Text('可搜索附近电脑 12 秒；配对确认将由系统显示。'),
-                        FilledButton.icon(
-                          key: const Key('discover-empty'),
-                          onPressed: snapshot.discovering
-                              ? null
-                              : () {
-                                  _companion(
-                                    widget.companionBridge.startDiscovery(),
-                                  );
-                                  discoveryTimer?.cancel();
-                                  discoveryTimer = Timer(
-                                    const Duration(seconds: 12),
-                                    () => _companion(
-                                      widget.companionBridge.stopDiscovery(),
-                                    ),
-                                  );
-                                },
-                          icon: const Icon(Icons.search),
-                          label: Text(
-                            snapshot.discovering ? '正在搜索…' : '搜索附近设备',
-                          ),
-                        ),
-                      ],
+            ),
+          )
+        else if (shownDevices.isEmpty)
+          const Padding(
+            padding: EdgeInsets.all(20),
+            child: Text('这里还没有电脑，试试“全部”。'),
+          )
+        else
+          Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: [
+              for (var i = 0; i < shownDevices.length; i++)
+                _DeviceCard(
+                  key: ValueKey(shownDevices[i].id),
+                  device: shownDevices[i],
+                  selected: snapshot.selectedDeviceId == shownDevices[i].id,
+                  onSelect: () => _companion(
+                    widget.companionBridge.selectDevice(shownDevices[i].id),
+                  ),
+                  onFavorite: () => _companion(
+                    widget.companionBridge.setFavorite(
+                      shownDevices[i].id,
+                      !shownDevices[i].favorite,
                     ),
                   ),
-                )
-              else if (shownDevices.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.all(20),
-                  child: Text('这里还没有电脑，试试“全部”。'),
-                )
-              else
-                Wrap(
-                  spacing: 12,
-                  runSpacing: 12,
-                  children: [
-                    for (var i = 0; i < shownDevices.length; i++)
-                      _DeviceCard(
-                        key: ValueKey(shownDevices[i].id),
-                        device: shownDevices[i],
-                        selected:
-                            snapshot.selectedDeviceId == shownDevices[i].id,
-                        onSelect: () => _companion(
-                          widget.companionBridge.selectDevice(
-                            shownDevices[i].id,
-                          ),
-                        ),
-                        onFavorite: () => _companion(
-                          widget.companionBridge.setFavorite(
-                            shownDevices[i].id,
-                            !shownDevices[i].favorite,
-                          ),
-                        ),
-                      ),
-                  ],
                 ),
-              const SizedBox(height: 12),
-              GlassSurface(
-                child: AnimatedSize(
+            ],
+          ),
+      ],
+    ];
+    final playbackPage = <Widget>[
+      Text('播放', style: Theme.of(context).textTheme.headlineMedium),
+      const SizedBox(height: 4),
+      Text('让手机的声音，在电脑继续。', style: Theme.of(context).textTheme.bodyMedium),
+      const SizedBox(height: 20),
+      GlassSurface(
+        child: ListTile(
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 20,
+            vertical: 8,
+          ),
+          leading: const Icon(Icons.laptop_rounded),
+          title: Text(selected?.name ?? '尚未选择电脑'),
+          subtitle: const Text('所选电脑 · 点击更换'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => setState(() => _page = 1),
+        ),
+      ),
+      const SizedBox(height: 16),
+      ...accessPrompt,
+      if (snapshot.permission && snapshot.bluetoothEnabled) ...[
+        GlassSurface(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              children: [
+                AnimatedSwitcher(
                   duration: _motionDuration(context),
-                  curve: Curves.easeOutCubic,
-                  alignment: Alignment.topCenter,
-                  child: Padding(
-                    padding: const EdgeInsets.all(20),
-                    child: Column(
-                      children: [
-                        AnimatedSwitcher(
-                          duration: _motionDuration(context),
-                          layoutBuilder: (current, _) =>
-                              current ?? const SizedBox.shrink(),
-                          child: Column(
-                            key: ValueKey(primaryTitle),
+                  layoutBuilder: (current, _) =>
+                      current ?? const SizedBox.shrink(),
+                  child: Column(
+                    key: ValueKey(primaryTitle),
+                    children: [
+                      AudioHalo(
+                        active: mediaPlaying || openedForThisPhone,
+                        icon: mediaPlaying
+                            ? Icons.graphic_eq
+                            : Icons.bluetooth_audio,
+                      ),
+                      const SizedBox(height: 16),
+                      ConnectionStatusLabel(
+                        key: const Key('primary-media-status'),
+                        state: mediaState,
+                        label: primaryTitle,
+                        style: Theme.of(context).textTheme.titleLarge,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  selected == null
+                      ? snapshot.devices.any(
+                              (d) => d.a2dpStateKnown && d.a2dpConnected,
+                            )
+                            ? '系统已有蓝牙媒体连接，请选择对应电脑以同步接收状态。'
+                            : '请选择电脑以查看本机蓝牙媒体状态。'
+                      : openedForThisPhone
+                      ? '电脑已确认本手机媒体路由已打开'
+                      : !selected.a2dpStateKnown
+                      ? '本机蓝牙媒体状态：正在确认'
+                      : selected.a2dpPlaying
+                      ? '本机蓝牙媒体：正在播放'
+                      : selected.a2dpConnected
+                      ? '本机蓝牙媒体：已连接到此电脑'
+                      : '本机蓝牙媒体：未连接此电脑',
+                  key: const Key('local-media-status'),
+                  textAlign: TextAlign.center,
+                ),
+                if (!mediaPlaying &&
+                    selected?.a2dpStateKnown == true &&
+                    (selected?.a2dpConnected == true ||
+                        selected?.a2dpPlaying == true))
+                  const Text(
+                    '媒体服务已连接不等于当前正在向电脑播放。',
+                    textAlign: TextAlign.center,
+                  ),
+                if (selected?.bonded == true &&
+                    (snapshot.controlState ==
+                            CompanionControlState.connecting ||
+                        snapshot.controlState == CompanionControlState.idle ||
+                        snapshot.controlState ==
+                            CompanionControlState.unavailable))
+                  TextButton.icon(
+                    key: const Key('retry-status'),
+                    onPressed:
+                        statusRetrying ||
+                            snapshot.controlState ==
+                                CompanionControlState.connecting
+                        ? null
+                        : _retryStatus,
+                    icon:
+                        statusRetrying ||
+                            snapshot.controlState ==
+                                CompanionControlState.connecting
+                        ? SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              value: MediaQuery.disableAnimationsOf(context)
+                                  ? .5
+                                  : null,
+                            ),
+                          )
+                        : const Icon(Icons.sync),
+                    label: Text(
+                      statusRetrying ||
+                              snapshot.controlState ==
+                                  CompanionControlState.connecting
+                          ? '正在同步…'
+                          : '重试电脑状态',
+                    ),
+                  ),
+                const SizedBox(height: 12),
+                Column(
+                  children: [
+                    const Divider(height: 20),
+                    AnimatedSwitcher(
+                      duration: _motionDuration(context),
+                      layoutBuilder: (current, _) =>
+                          current ?? const SizedBox.shrink(),
+                      child: Column(
+                        key: ValueKey('${status.$1}|${status.$2}'),
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
                             children: [
-                              AudioHalo(
-                                active: mediaPlaying || openedForThisPhone,
-                                icon: mediaPlaying
-                                    ? Icons.graphic_eq
-                                    : Icons.bluetooth_audio,
-                              ),
-                              const SizedBox(height: 16),
-                              Text(
-                                primaryTitle,
-                                key: const Key('primary-media-status'),
-                                style: Theme.of(context).textTheme.titleLarge,
-                                textAlign: TextAlign.center,
+                              Flexible(
+                                child: ConnectionStatusLabel(
+                                  key: const Key('receiver-status'),
+                                  state: receiverState,
+                                  label: status.$1,
+                                ),
                               ),
                             ],
                           ),
-                        ),
-                        const SizedBox(height: 12),
-                        Text(
-                          selected == null
-                              ? snapshot.devices.any(
-                                      (d) =>
-                                          d.a2dpStateKnown && d.a2dpConnected,
-                                    )
-                                    ? '系统已有蓝牙媒体连接，请选择对应电脑以同步接收状态。'
-                                    : '请选择电脑以查看本机蓝牙媒体状态。'
-                              : openedForThisPhone
-                              ? '电脑已确认本手机媒体路由已打开'
-                              : !selected.a2dpStateKnown
-                              ? '本机蓝牙媒体状态：正在确认'
-                              : selected.a2dpPlaying
-                              ? '本机蓝牙媒体：正在播放'
-                              : selected.a2dpConnected
-                              ? '本机蓝牙媒体：已连接到此电脑'
-                              : '本机蓝牙媒体：未连接此电脑',
-                          key: const Key('local-media-status'),
-                          textAlign: TextAlign.center,
-                        ),
-                        if (!mediaPlaying &&
-                            selected?.a2dpStateKnown == true &&
-                            (selected?.a2dpConnected == true ||
-                                selected?.a2dpPlaying == true))
-                          const Text(
-                            '媒体服务已连接不等于当前正在向电脑播放。',
-                            textAlign: TextAlign.center,
-                          ),
-                        if (selected?.bonded == true &&
-                            (snapshot.controlState ==
-                                    CompanionControlState.connecting ||
-                                snapshot.controlState ==
-                                    CompanionControlState.idle ||
-                                snapshot.controlState ==
-                                    CompanionControlState.unavailable))
-                          TextButton.icon(
-                            key: const Key('retry-status'),
-                            onPressed:
-                                statusRetrying ||
-                                    snapshot.controlState ==
-                                        CompanionControlState.connecting
-                                ? null
-                                : _retryStatus,
-                            icon:
-                                statusRetrying ||
-                                    snapshot.controlState ==
-                                        CompanionControlState.connecting
-                                ? SizedBox.square(
-                                    dimension: 18,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      value:
-                                          MediaQuery.disableAnimationsOf(
-                                            context,
-                                          )
-                                          ? .5
-                                          : null,
-                                    ),
-                                  )
-                                : const Icon(Icons.sync),
-                            label: Text(
-                              statusRetrying ||
-                                      snapshot.controlState ==
-                                          CompanionControlState.connecting
-                                  ? '正在同步…'
-                                  : '重试电脑状态',
-                            ),
-                          ),
-                        const SizedBox(height: 12),
-                        Column(
-                          children: [
-                            const Divider(height: 20),
-                            AnimatedSwitcher(
-                              duration: _motionDuration(context),
-                              layoutBuilder: (current, _) =>
-                                  current ?? const SizedBox.shrink(),
-                              child: Column(
-                                key: ValueKey('${status.$1}|${status.$2}'),
-                                children: [
-                                  Row(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      Icon(status.$3, size: 16),
-                                      const SizedBox(width: 6),
-                                      Flexible(child: Text(status.$1)),
-                                    ],
-                                  ),
-                                  Text(status.$2, textAlign: TextAlign.center),
-                                ],
-                              ),
-                            ),
-                            const Divider(height: 20),
-                            ExpansionTile(
-                              title: const Text('连接指南'),
-                              children: [
-                                _Step(
-                                  done: selected?.bonded == true,
-                                  text: selected?.bonding == true
-                                      ? '正在配对电脑'
-                                      : '1. 与 Windows 电脑完成蓝牙配对。',
-                                ),
-                                _Step(
-                                  done:
-                                      status.$1 == '电脑已准备好' ||
-                                      status.$1 == '连接已打开',
-                                  text: mediaPlaying && !openedForThisPhone
-                                      ? '2. 电脑接收状态待同步，不影响当前蓝牙播放。'
-                                      : '2. 在电脑端选择手机并开启接收。',
-                                ),
-                                _Step(
-                                  done: mediaPlaying || openedForThisPhone,
-                                  text: mediaPlaying
-                                      ? '3. 手机系统已报告向此电脑播放蓝牙媒体。'
-                                      : localConnected || openedForThisPhone
-                                      ? '3. 蓝牙媒体已连接；仍请确认媒体输出选择这台电脑。'
-                                      : '3. 在手机媒体输出中选择这台电脑。',
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ],
+                          Text(status.$2, textAlign: TextAlign.center),
+                        ],
+                      ),
                     ),
-                  ),
+                  ],
                 ),
-              ),
-              const SizedBox(height: 10),
-              if (snapshot.outputSwitcherSupported)
-                FilledButton.icon(
-                  key: const Key('output-switcher'),
-                  onPressed: () async {
-                    try {
-                      final shown = await widget.companionBridge
-                          .showOutputSwitcher();
-                      if (!shown && mounted) {
-                        setState(
-                          () => error = '系统未打开媒体输出面板，请从正在播放 App 的通知中选择媒体输出。',
-                        );
-                      }
-                    } catch (e) {
-                      if (mounted) setState(() => error = '$e');
-                    }
-                  },
-                  icon: const Icon(Icons.speaker_group),
-                  label: const Text('选择媒体输出'),
-                )
-              else
-                const Text(
-                  'Android 12–13：请从正在播放 App 的通知中选择媒体输出。',
-                  textAlign: TextAlign.center,
-                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        if (snapshot.outputSwitcherSupported)
+          FilledButton.icon(
+            key: const Key('output-switcher'),
+            onPressed: () async {
+              try {
+                final shown = await widget.companionBridge.showOutputSwitcher();
+                if (!shown && mounted) {
+                  setState(() => error = '系统未打开媒体输出面板，请从正在播放 App 的通知中选择媒体输出。');
+                }
+              } catch (e) {
+                if (mounted) setState(() => error = '$e');
+              }
+            },
+            icon: const Icon(Icons.speaker_group),
+            label: const Text('选择媒体输出'),
+          )
+        else
+          const Text(
+            'Android 12–13：请从正在播放 App 的通知中选择媒体输出。',
+            textAlign: TextAlign.center,
+          ),
+      ],
+      const SizedBox(height: 16),
+      _volumeCard(),
+    ];
+    final settingsPage = <Widget>[
+      Text('设置', style: Theme.of(context).textTheme.headlineMedium),
+      const SizedBox(height: 4),
+      const Text('快捷入口、应用更新与连接帮助'),
+      const SizedBox(height: 20),
+      _updateCard(),
+      const SizedBox(height: 16),
+      GlassSurface(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text('快捷入口', style: Theme.of(context).textTheme.titleMedium),
               Wrap(
                 alignment: WrapAlignment.center,
                 children: [
@@ -766,12 +786,41 @@ class _AndroidScreenState extends State<AndroidScreen>
                 ],
               ),
             ],
-            const SizedBox(height: 12),
-            _volumeCard(),
-            const SizedBox(height: 12),
-            _updateCard(),
-            const SizedBox(height: 12),
+          ),
+        ),
+      ),
+      const SizedBox(height: 16),
+      GlassSurface(
+        child: Column(
+          children: [
             ExpansionTile(
+              key: const PageStorageKey('connection-guide'),
+              title: const Text('连接指南'),
+              children: [
+                _Step(
+                  done: selected?.bonded == true,
+                  text: selected?.bonding == true
+                      ? '正在配对电脑'
+                      : '1. 与 Windows 电脑完成蓝牙配对。',
+                ),
+                _Step(
+                  done: status.$1 == '电脑已准备好' || status.$1 == '连接已打开',
+                  text: mediaPlaying && !openedForThisPhone
+                      ? '2. 电脑接收状态待同步，不影响当前蓝牙播放。'
+                      : '2. 在电脑端选择手机并开启接收。',
+                ),
+                _Step(
+                  done: mediaPlaying || openedForThisPhone,
+                  text: mediaPlaying
+                      ? '3. 手机系统已报告向此电脑播放蓝牙媒体。'
+                      : localConnected || openedForThisPhone
+                      ? '3. 蓝牙媒体已连接；仍请确认媒体输出选择这台电脑。'
+                      : '3. 在手机媒体输出中选择这台电脑。',
+                ),
+              ],
+            ),
+            ExpansionTile(
+              key: const PageStorageKey('troubleshooting'),
               initiallyExpanded: false,
               title: const Text('测试与排障'),
               childrenPadding: const EdgeInsets.all(12),
@@ -816,17 +865,69 @@ class _AndroidScreenState extends State<AndroidScreen>
                   Text(heard! ? '已人工确认听到测试音。' : '请检查电脑接收、媒体输出和音量后重试。'),
               ],
             ),
-            if (error != null)
-              Text(
-                '操作失败：$error',
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
-              ),
-            if (info != null) Text(info!, textAlign: TextAlign.center),
-            if (snapshot.message.isNotEmpty)
-              Text('电脑消息：${snapshot.message}', textAlign: TextAlign.center),
           ],
         ),
       ),
+    ];
+    return Column(
+      children: [
+        Expanded(
+          child: Align(
+            alignment: Alignment.topCenter,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: SingleChildScrollView(
+                key: PageStorageKey('android-page-$_page'),
+                padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    ...[playbackPage, devicePage, settingsPage][_page],
+                    if (error != null)
+                      Text(
+                        '操作失败：$error',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    if (info != null) Text(info!, textAlign: TextAlign.center),
+                    if (snapshot.message.isNotEmpty)
+                      Text(
+                        '电脑消息：${snapshot.message}',
+                        textAlign: TextAlign.center,
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+        NavigationBar(
+          key: const Key('android-navigation'),
+          selectedIndex: _page,
+          onDestinationSelected: (index) => setState(() => _page = index),
+          destinations: const [
+            NavigationDestination(
+              key: Key('nav-playback'),
+              icon: Icon(Icons.headphones_outlined),
+              selectedIcon: Icon(Icons.headphones),
+              label: '播放',
+            ),
+            NavigationDestination(
+              key: Key('nav-devices'),
+              icon: Icon(Icons.devices_outlined),
+              selectedIcon: Icon(Icons.devices),
+              label: '设备',
+            ),
+            NavigationDestination(
+              key: Key('nav-settings'),
+              icon: Icon(Icons.settings_outlined),
+              selectedIcon: Icon(Icons.settings),
+              label: '设置',
+            ),
+          ],
+        ),
+      ],
     );
   }
 
@@ -936,11 +1037,15 @@ class _AndroidScreenState extends State<AndroidScreen>
         ? '正在检查更新…'
         : updateInstalling
         ? '正在准备安装…'
+        : updateError != null
+        ? updateError!
+        : update?.message.isNotEmpty == true
+        ? update!.message
         : update?.available == true
         ? '发现新版本 ${update!.latestVersion}'
         : update == null
         ? '尚未检查更新'
-        : '当前已是最新版本';
+        : '当前没有可用的 Android 更新';
     return GlassSurface(
       child: Padding(
         padding: const EdgeInsets.all(20),
@@ -965,7 +1070,9 @@ class _AndroidScreenState extends State<AndroidScreen>
             if (update?.available == true)
               FilledButton(
                 key: const Key('install-update'),
-                onPressed: updateInstalling ? null : _installUpdate,
+                onPressed: updateInstalling || updateChecking
+                    ? null
+                    : _installUpdate,
                 child: Text(updateInstalling ? '处理中…' : '立即更新'),
               )
             else
@@ -1010,20 +1117,36 @@ class _DeviceCardState extends State<_DeviceCard> {
   Widget build(BuildContext context) {
     final device = widget.device;
     final selected = widget.selected;
-    final label = device.a2dpStateKnown && device.a2dpConnected
+    final connected =
+        device.a2dpStateKnown && (device.a2dpConnected || device.a2dpPlaying);
+    final indicator = connected
+        ? ConnectionIndicatorState.connected
+        : device.bonding
+        ? ConnectionIndicatorState.pending
+        : device.a2dpStateKnown
+        ? ConnectionIndicatorState.disconnected
+        : ConnectionIndicatorState.unknown;
+    final label = connected
         ? '媒体已连接'
         : device.bonding
         ? '正在配对'
+        : device.a2dpStateKnown
+        ? '媒体已断开'
         : device.bonded
         ? '已配对'
         : device.recent
         ? '最近使用'
         : '附近设备';
-    return SizedBox(
-      width: ((MediaQuery.sizeOf(context).width - 64) / 2).clamp(128, 170),
-      height:
-          144 +
-          (MediaQuery.textScalerOf(context).scale(14) - 14).clamp(0, 60) * 3,
+    final width = ((MediaQuery.sizeOf(context).width - 64) / 2).clamp(
+      128.0,
+      170.0,
+    );
+    return ConstrainedBox(
+      constraints: BoxConstraints(
+        minWidth: width,
+        maxWidth: width,
+        minHeight: 144,
+      ),
       child: InkWell(
         key: Key('device-${device.id}'),
         borderRadius: BorderRadius.circular(28),
@@ -1090,7 +1213,11 @@ class _DeviceCardState extends State<_DeviceCard> {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    Text(label, style: Theme.of(context).textTheme.labelSmall),
+                    ConnectionStatusLabel(
+                      state: indicator,
+                      label: label,
+                      style: Theme.of(context).textTheme.labelSmall,
+                    ),
                     if (device.recent)
                       Text(
                         '最近使用',

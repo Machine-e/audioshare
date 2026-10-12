@@ -1,7 +1,7 @@
 name: audioshare
 description: Use a Windows PC as a Bluetooth A2DP audio receiver.
 publish_to: 'none'
-version: 0.2.2+4
+version: 0.2.4+6
 
 environment:
   sdk: ^3.12.2

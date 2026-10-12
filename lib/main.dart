@@ -337,63 +337,58 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
-  Widget build(BuildContext context) => AmbientBackground(
-    child: Scaffold(
-      appBar: AppBar(
-        title: const Text('AudioShare'),
-        actions: [
-          PopupMenuButton<ThemeMode>(
-            key: const Key('theme-menu'),
-            tooltip: '外观',
-            initialValue: widget.themeMode,
-            onSelected: widget.onThemeChanged,
-            icon: Icon(
-              Theme.of(context).brightness == Brightness.dark
-                  ? Icons.dark_mode_outlined
-                  : Icons.light_mode_outlined,
+  Widget build(BuildContext context) {
+    // Use the requested mode, not AnimatedTheme's intermediate brightness, so
+    // another tap during the transition immediately reverses the selection.
+    final isDark =
+        widget.themeMode == ThemeMode.dark ||
+        (widget.themeMode == ThemeMode.system &&
+            MediaQuery.platformBrightnessOf(context) == Brightness.dark);
+    return AmbientBackground(
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('AudioShare'),
+          actions: [
+            IconButton(
+              key: const Key('theme-toggle'),
+              tooltip: isDark ? '切换到亮色' : '切换到暗色',
+              onPressed: () => widget.onThemeChanged(
+                isDark ? ThemeMode.light : ThemeMode.dark,
+              ),
+              icon: Icon(
+                isDark ? Icons.light_mode_outlined : Icons.dark_mode_outlined,
+              ),
             ),
-            itemBuilder: (_) => [
-              for (final option in [
-                (ThemeMode.light, '亮色'),
-                (ThemeMode.dark, '暗色'),
-                (ThemeMode.system, '跟随系统'),
-              ])
-                CheckedPopupMenuItem(
-                  value: option.$1,
-                  checked: widget.themeMode == option.$1,
-                  child: Text(option.$2),
+            const SizedBox(width: 16),
+          ],
+        ),
+        body: SafeArea(
+          child: widget.isAndroid
+              ? AndroidScreen(
+                  routeBridge: widget.bridge,
+                  companionBridge: widget.companionBridge,
+                  updateBridge: widget.enableUpdateChecks
+                      ? AndroidUpdateBridge()
+                      : null,
+                )
+              : Align(
+                  alignment: Alignment.topCenter,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: widget.isWindows ? 1040 : 560,
+                    ),
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.fromLTRB(24, 12, 24, 32),
+                      child: widget.isWindows
+                          ? _WindowsContent(controller)
+                          : const Text('当前平台不支持。'),
+                    ),
+                  ),
                 ),
-            ],
-          ),
-          const SizedBox(width: 16),
-        ],
-      ),
-      body: SafeArea(
-        child: Align(
-          alignment: Alignment.topCenter,
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              maxWidth: widget.isWindows ? 1040 : 560,
-            ),
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(24, 12, 24, 32),
-              child: widget.isWindows
-                  ? _WindowsContent(controller)
-                  : widget.isAndroid
-                  ? AndroidScreen(
-                      routeBridge: widget.bridge,
-                      companionBridge: widget.companionBridge,
-                      updateBridge: widget.enableUpdateChecks
-                          ? AndroidUpdateBridge()
-                          : null,
-                    )
-                  : const Text('当前平台不支持。'),
-            ),
-          ),
         ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 class _WindowsContent extends StatelessWidget {

@@ -1,5 +1,50 @@
 import 'package:flutter/material.dart';
 
+enum ConnectionIndicatorState { connected, disconnected, pending, unknown }
+
+class ConnectionStatusLabel extends StatelessWidget {
+  const ConnectionStatusLabel({
+    super.key,
+    required this.state,
+    required this.label,
+    this.style,
+  });
+  final ConnectionIndicatorState state;
+  final String label;
+  final TextStyle? style;
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final color = switch (state) {
+      ConnectionIndicatorState.connected =>
+        dark ? const Color(0xff6cdda1) : const Color(0xff16834a),
+      ConnectionIndicatorState.disconnected =>
+        dark ? const Color(0xffff8c88) : const Color(0xffc83b3b),
+      ConnectionIndicatorState.pending =>
+        dark ? const Color(0xfff1c46a) : const Color(0xff986300),
+      ConnectionIndicatorState.unknown => Theme.of(context).colorScheme.outline,
+    };
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        ExcludeSemantics(
+          child: Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Flexible(
+          child: Text(label, style: style, textAlign: TextAlign.center),
+        ),
+      ],
+    );
+  }
+}
+
 Duration motionDuration(BuildContext context) =>
     MediaQuery.disableAnimationsOf(context)
     ? Duration.zero
@@ -111,6 +156,8 @@ ThemeData audioShareTheme(Brightness brightness) {
       inactiveTrackColor: scheme.primary.withValues(alpha: .12),
     ),
     expansionTileTheme: const ExpansionTileThemeData(
+      // Help opens immediately without resizing the scroll view every frame.
+      expansionAnimationStyle: AnimationStyle.noAnimation,
       shape: Border(),
       collapsedShape: Border(),
       tilePadding: EdgeInsets.symmetric(horizontal: 8),

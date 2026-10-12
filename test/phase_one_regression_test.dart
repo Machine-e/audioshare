@@ -284,6 +284,9 @@ void main() {
         ),
       );
       await tester.pump();
+      await tester.tap(find.byKey(const Key('nav-settings')));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('测试与排障'));
       await tester.tap(find.text('测试与排障'));
       await tester.pumpAndSettle();
       await tester.ensureVisible(find.byKey(const Key('test-tone')));

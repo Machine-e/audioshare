@@ -35,6 +35,18 @@ void main() {
 
   for (final scenario in [
     (
+      'android-devices',
+      TargetPlatform.android,
+      Size(412, 900),
+      Brightness.light,
+    ),
+    (
+      'android-settings',
+      TargetPlatform.android,
+      Size(412, 900),
+      Brightness.dark,
+    ),
+    (
       'android-light',
       TargetPlatform.android,
       const Size(412, 1100),
@@ -222,6 +234,16 @@ void main() {
           ),
         ),
       );
+      if ([
+        'android-devices',
+        'android-scanning',
+        'android-empty',
+        'android-permission',
+      ].contains(scenario.$1)) {
+        await tester.pump();
+        await tester.tap(find.byKey(const Key('nav-devices')));
+        await tester.pump();
+      }
       if (scenario.$1 == 'android-scanning') {
         await tester.pump();
         await tester.pump(const Duration(seconds: 3));
@@ -242,7 +264,13 @@ void main() {
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 100));
       }
+      if (scenario.$1 == 'android-settings') {
+        await tester.tap(find.byKey(const Key('nav-settings')));
+        await tester.pumpAndSettle();
+      }
       if (scenario.$1 == 'android-confirmed') {
+        await tester.tap(find.byKey(const Key('nav-settings')));
+        await tester.pumpAndSettle();
         await tester.ensureVisible(find.text('测试与排障'));
         await tester.tap(find.text('测试与排障'));
         await tester.pumpAndSettle();

@@ -13,7 +13,8 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
-import org.json.JSONObject
+import org.json.JSONArray
+import android.os.Build
 
 class MainActivity : FlutterActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -162,35 +163,30 @@ class MainActivity : FlutterActivity() {
                 connection.setRequestProperty("Accept", "application/vnd.github+json")
                 connection.setRequestProperty("User-Agent", "AudioShare/${currentVersionName()}")
                 try {
-                    if (connection.responseCode !in 200..299) {
-                        throw IllegalStateException("更新服务器返回 HTTP ${connection.responseCode}")
-                    }
-                    val release = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
-                    val latestVersion = release.getString("tag_name").removePrefix("v")
-                    val assets = release.getJSONArray("assets")
-                    var downloadUrl = ""
-                    for (index in 0 until assets.length()) {
-                        val asset = assets.getJSONObject(index)
-                        if (asset.optString("name") == APK_ASSET_NAME) {
-                            downloadUrl = asset.optString("browser_download_url")
-                            break
+                    val code = connection.responseCode
+                    if (code !in 200..299) {
+                        val message = when (code) {
+                            403, 429 -> "更新服务暂时限制了请求，请稍后重试"
+                            404 -> "更新发布地址暂不可用，请稍后重试"
+                            else -> "更新服务器暂不可用（HTTP $code）"
                         }
+                        throw IllegalStateException(message)
                     }
-                    if (downloadUrl.isBlank()) {
-                        throw IllegalStateException("最新版本没有找到 $APK_ASSET_NAME")
-                    }
-                    val currentVersion = currentVersionName()
-                    val available = compareVersions(latestVersion, currentVersion) > 0
-                    mainHandler.post {
-                        result.success(
-                            mapOf(
-                                "available" to available,
-                                "currentVersion" to currentVersion,
-                                "latestVersion" to latestVersion,
-                                "downloadUrl" to downloadUrl,
-                            ),
+                    val payload = JSONArray(connection.inputStream.bufferedReader().use { it.readText() })
+                    val releases = (0 until payload.length()).map { index ->
+                        val release = payload.getJSONObject(index)
+                        val assets = release.optJSONArray("assets") ?: JSONArray()
+                        AppRelease(
+                            release.optString("tag_name"),
+                            (0 until assets.length()).map { assetIndex ->
+                                val asset = assets.getJSONObject(assetIndex)
+                                ReleaseAsset(asset.optString("name"), asset.optString("browser_download_url"))
+                            },
+                            release.optBoolean("draft"), release.optBoolean("prerelease"),
                         )
                     }
+                    val update = AndroidReleaseSelector.select(releases, currentVersionName(), Build.SUPPORTED_ABIS.toList())
+                    mainHandler.post { result.success(update) }
                 } finally {
                     connection.disconnect()
                 }
@@ -198,7 +194,11 @@ class MainActivity : FlutterActivity() {
                 mainHandler.post {
                     result.error(
                         "update_check_failed",
-                        exception.message ?: "检查更新失败",
+                        when (exception) {
+                            is java.io.IOException -> "无法连接更新服务，请检查网络后重试"
+                            is org.json.JSONException -> "更新服务返回了无法识别的数据，请稍后重试"
+                            else -> exception.message ?: "检查更新失败，请稍后重试"
+                        },
                         exception.javaClass.simpleName,
                     )
                 }
@@ -233,8 +233,12 @@ class MainActivity : FlutterActivity() {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 mainHandler.post {
-                    startActivity(intent)
-                    result.success(null)
+                    try {
+                        startActivity(intent)
+                        result.success(null)
+                    } catch (exception: Exception) {
+                        result.error("update_install_failed", "无法打开安装器，请检查应用安装权限", null)
+                    }
                 }
             } catch (exception: Exception) {
                 mainHandler.post {
@@ -248,16 +252,6 @@ class MainActivity : FlutterActivity() {
         }.start()
     }
 
-    private fun compareVersions(left: String, right: String): Int {
-        val leftParts = left.split('.').map { it.toIntOrNull() ?: 0 }
-        val rightParts = right.split('.').map { it.toIntOrNull() ?: 0 }
-        for (index in 0 until maxOf(leftParts.size, rightParts.size)) {
-            val comparison = (leftParts.getOrElse(index) { 0 }).compareTo(rightParts.getOrElse(index) { 0 })
-            if (comparison != 0) return comparison
-        }
-        return 0
-    }
-
     @Suppress("DEPRECATION")
     private fun currentVersionName(): String =
         packageManager.getPackageInfo(packageName, 0).versionName ?: "0.0.0"
@@ -266,7 +260,7 @@ class MainActivity : FlutterActivity() {
         private const val CHANNEL = "com.machinee.audioshare/external_route"
         private const val UPDATE_CHANNEL = "com.machinee.audioshare/update"
         private const val LATEST_RELEASE_URL =
-            "https://api.github.com/repos/Machine-e/audioshare/releases/latest"
+            "https://api.github.com/repos/Machine-e/audioshare/releases?per_page=100"
         private const val APK_ASSET_NAME = "AudioShare-Android.apk"
         private const val NETWORK_TIMEOUT_MS = 15_000
         private const val TEST_TONE_VOLUME_PERCENT = 20
