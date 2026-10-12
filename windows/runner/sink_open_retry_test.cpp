@@ -15,6 +15,61 @@ void Check(bool value, const char* reason) {
 }
 
 int main() {
+  // Regression: the driver reports Opened and creates volume controls, but
+  // its first render graph remains silent. Success must also cross the full
+  // stop/start boundary once, with no premature connected/disconnected event.
+  {
+    SinkStateMachine state;
+    const auto generation = state.Begin(0, true);
+    int sessions = 0, closes = 0;
+    bool alive = false;
+    const auto result = audioshare::RecoverSinkSessionOnce([&] {
+      Check(!alive, "warm-up object must be released before the real session");
+      alive = true;
+      ++sessions;
+      state.Opened(generation);
+      Check(!state.TakeChange(generation), "warm-up must not publish connected");
+      return SinkOpenOutcome::opened;
+    }, [&](auto reason) {
+      Check(reason == SinkOpenOutcome::opened, "successful but silent warm-up is rebuilt");
+      ++closes;
+      alive = false;
+      state.Closed(generation);
+      Check(!state.terminal_applied(), "warm-up close is not a disconnect");
+    }, [] { return true; }, true);
+    Check(result == SinkOpenOutcome::opened && sessions == 2 && closes == 1,
+          "success gets exactly one full rebuild, not an endless silence retry");
+    state.FinishStartup(generation);
+    state.Opened(generation);
+    Check(state.TakeInitial(generation) == SinkState::opened,
+          "only the final session is reported to the UI");
+  }
+  for (auto first : {SinkOpenOutcome::opened, SinkOpenOutcome::transient_failure,
+                     SinkOpenOutcome::denied, SinkOpenOutcome::cancelled}) {
+    for (auto second : {SinkOpenOutcome::opened, SinkOpenOutcome::transient_failure,
+                        SinkOpenOutcome::denied, SinkOpenOutcome::cancelled}) {
+      int sessions = 0, resets = 0;
+      const auto result = audioshare::RecoverSinkSessionOnce(
+          [&] { return ++sessions == 1 ? first : second; },
+          [&](auto) { ++resets; }, [] { return true; }, true);
+      const bool rebuild = first == SinkOpenOutcome::opened ||
+                           first == SinkOpenOutcome::transient_failure;
+      Check(sessions == (rebuild ? 2 : 1) && resets == (rebuild ? 1 : 0),
+            "warm-up and failure recovery share a single rebuild budget");
+      Check(result == (rebuild ? second : first),
+            "final failure cannot be masked by successful warm-up");
+    }
+  }
+  {
+    int sessions = 0;
+    bool current = true;
+    const auto result = audioshare::RecoverSinkSessionOnce([&] {
+      ++sessions;
+      return SinkOpenOutcome::opened;
+    }, [&](auto) { current = false; }, [&] { return current; }, true);
+    Check(result == SinkOpenOutcome::cancelled && sessions == 1,
+          "stop or device change during warm-up cannot reopen the old device");
+  }
   {
     int sessions = 0, closes = 0;
     bool failed_session_alive = false;
@@ -23,7 +78,7 @@ int main() {
       ++sessions;
       failed_session_alive = true;
       return sessions == 1 ? SinkOpenOutcome::transient_failure : SinkOpenOutcome::opened;
-    }, [&] { ++closes; failed_session_alive = false; }, [] { return true; });
+    }, [&](auto) { ++closes; failed_session_alive = false; }, [] { return true; });
     Check(result == SinkOpenOutcome::opened && sessions == 2 && closes == 1,
           "failed first session recovers without a second user request");
   }
@@ -31,7 +86,7 @@ int main() {
                        SinkOpenOutcome::cancelled, SinkOpenOutcome::transient_failure}) {
     int attempts = 0, resets = 0;
     const auto result = audioshare::RecoverSinkSessionOnce([&] { ++attempts; return outcome; },
-        [&] { ++resets; }, [] { return true; });
+        [&](auto) { ++resets; }, [] { return true; });
     Check(result == outcome, "recovery preserves final outcome");
     Check(attempts == (outcome == SinkOpenOutcome::transient_failure ? 2 : 1),
           "only failed sessions are rebuilt, at most once");
@@ -43,7 +98,7 @@ int main() {
     int attempts = 0;
     const auto result = audioshare::RecoverSinkSessionOnce([&] {
       ++attempts; return SinkOpenOutcome::transient_failure;
-    }, [&] { current = false; }, [&] { return current; });
+    }, [&](auto) { current = false; }, [&] { return current; });
     Check(result == SinkOpenOutcome::cancelled && attempts == 1,
           "stop during disposal prevents a new connection");
   }

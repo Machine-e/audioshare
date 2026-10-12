@@ -30,20 +30,12 @@ class AndroidScreen extends StatefulWidget {
 class _AndroidScreenState extends State<AndroidScreen>
     with WidgetsBindingObserver {
   CompanionSnapshot snapshot = const CompanionSnapshot();
-  MediaVolume? volume;
-  double? draft;
   String? error;
   String? info;
   AndroidUpdateInfo? updateInfo;
   String? updateError;
   bool updateChecking = false, updateInstalling = false;
-  bool volumeLoading = true,
-      busy = false,
-      tone = false,
-      toneStarted = false,
-      statusRetrying = false;
-  int _volumeEpoch = 0;
-  int volumeRefreshes = 0;
+  bool busy = false, tone = false, toneStarted = false, statusRetrying = false;
   int statusRefreshes = 0;
   int _lastRevision = -1;
   String _deviceFilter = '全部';
@@ -69,7 +61,6 @@ class _AndroidScreenState extends State<AndroidScreen>
       },
     );
     unawaited(_loadSnapshot());
-    unawaited(_refreshVolume());
     if (widget.updateBridge != null) unawaited(_checkForUpdate());
   }
 
@@ -134,65 +125,6 @@ class _AndroidScreenState extends State<AndroidScreen>
       }
     } finally {
       if (mounted) setState(() => statusRetrying = false);
-    }
-  }
-
-  Future<void> _refreshVolume() async {
-    if (busy) return;
-    final epoch = ++_volumeEpoch;
-    if (mounted) {
-      setState(() {
-        volumeLoading = true;
-        volumeRefreshes++;
-      });
-    }
-    try {
-      final v = await widget.routeBridge.getMediaVolume();
-      if (mounted && epoch == _volumeEpoch) {
-        setState(() {
-          volume = v;
-          draft = null;
-          error = null;
-        });
-      }
-    } catch (e) {
-      if (mounted && epoch == _volumeEpoch) {
-        setState(() {
-          volume = null;
-          draft = null;
-          error = '$e';
-        });
-      }
-    } finally {
-      if (mounted && epoch == _volumeEpoch) {
-        setState(() => volumeLoading = false);
-      }
-    }
-  }
-
-  Future<void> _commitVolume(double value) async {
-    final epoch = ++_volumeEpoch;
-    final old = volume;
-    setState(() => busy = true);
-    try {
-      final actual = await widget.routeBridge.setMediaVolume(value.round());
-      if (mounted && epoch == _volumeEpoch) {
-        setState(() {
-          volume = actual;
-          draft = null;
-          error = null;
-        });
-      }
-    } catch (e) {
-      if (mounted && epoch == _volumeEpoch) {
-        setState(() {
-          volume = old;
-          draft = null;
-          error = '$e';
-        });
-      }
-    } finally {
-      if (mounted) setState(() => busy = false);
     }
   }
 
@@ -285,7 +217,6 @@ class _AndroidScreenState extends State<AndroidScreen>
     if (state == AppLifecycleState.resumed) {
       _active = true;
       if (updateInstalling) setState(() => updateInstalling = false);
-      unawaited(_refreshVolume());
       unawaited(_loadSnapshot());
     } else {
       _active = false;
@@ -744,8 +675,6 @@ class _AndroidScreenState extends State<AndroidScreen>
             textAlign: TextAlign.center,
           ),
       ],
-      const SizedBox(height: 16),
-      _volumeCard(),
     ];
     final settingsPage = <Widget>[
       Text('设置', style: Theme.of(context).textTheme.headlineMedium),
@@ -948,87 +877,6 @@ class _AndroidScreenState extends State<AndroidScreen>
     } catch (e) {
       if (mounted) setState(() => error = '$e');
     }
-  }
-
-  Widget _volumeCard() {
-    final v = volume,
-        shown = draft ?? v?.current.toDouble() ?? 0,
-        percent = v == null || v.max <= 0 ? 0 : (shown * 100 / v.max).round();
-    return GlassSurface(
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          children: [
-            Wrap(
-              alignment: WrapAlignment.spaceBetween,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 10,
-              children: [
-                const Icon(Icons.volume_up_rounded, size: 30),
-                const Text('传输音量'),
-                AnimatedScale(
-                  scale: draft == null ? 1 : 1.08,
-                  duration: _motionDuration(context),
-                  curve: Curves.easeOutCubic,
-                  child: Text(
-                    v == null || !v.available ? '—' : '$percent%',
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-                IconButton(
-                  key: const Key('refresh-volume'),
-                  tooltip: '刷新音量',
-                  onPressed: volumeLoading || busy ? null : _refreshVolume,
-                  icon: AnimatedRotation(
-                    turns: volumeRefreshes.toDouble(),
-                    duration: MediaQuery.disableAnimationsOf(context)
-                        ? Duration.zero
-                        : const Duration(milliseconds: 650),
-                    curve: Curves.easeInOutCubic,
-                    child: const Icon(Icons.refresh),
-                  ),
-                ),
-              ],
-            ),
-            if (volumeLoading)
-              const LinearProgressIndicator()
-            else if (v != null && v.available)
-              SliderTheme(
-                data: SliderTheme.of(context).copyWith(
-                  trackHeight: 8,
-                  trackShape: const RoundedRectSliderTrackShape(),
-                  thumbShape: const RoundSliderThumbShape(
-                    enabledThumbRadius: 7,
-                  ),
-                  overlayShape: const RoundSliderOverlayShape(
-                    overlayRadius: 15,
-                  ),
-                  thumbColor: Theme.of(
-                    context,
-                  ).colorScheme.primary.withValues(alpha: .65),
-                ),
-                child: Slider(
-                  key: const Key('media-volume-slider'),
-                  value: shown.clamp(0, v.max <= 0 ? 1 : v.max).toDouble(),
-                  max: v.max <= 0 ? 1 : v.max.toDouble(),
-                  onChanged: v.fixed || v.max <= 0 || busy
-                      ? null
-                      : (x) => setState(() => draft = x),
-                  onChangeEnd: v.fixed || v.max <= 0 || busy
-                      ? null
-                      : _commitVolume,
-                ),
-              ),
-            if (v != null && !v.available)
-              Text(v.message, textAlign: TextAlign.center)
-            else if (v?.fixed == true)
-              const Text('当前音频通路的音量不可调节。'),
-          ],
-        ),
-      ),
-    );
   }
 
   Widget _updateCard() {

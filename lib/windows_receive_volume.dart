@@ -164,7 +164,7 @@ class _WindowsReceiveVolumeState extends State<WindowsReceiveVolume> {
                 const SizedBox(width: 10),
                 Expanded(
                   child: Text(
-                    '接收音量 · 试用',
+                    '接收音量',
                     style: Theme.of(context).textTheme.titleMedium,
                   ),
                 ),

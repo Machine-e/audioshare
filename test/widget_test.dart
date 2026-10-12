@@ -319,9 +319,7 @@ void main() {
     semantics.dispose();
   });
 
-  testWidgets('Android has four honest steps, volume and settings', (
-    tester,
-  ) async {
+  testWidgets('Android has four honest steps and settings', (tester) async {
     await tester.pumpWidget(
       AudioShareApp(
         bridge: FakeBridge(),
@@ -350,48 +348,7 @@ void main() {
   });
 
   testWidgets(
-    'Android slider drafts then commits and fixed volume disables it',
-    (tester) async {
-      final bridge = FakeBridge();
-      await tester.pumpWidget(
-        AudioShareApp(
-          bridge: bridge,
-          companionBridge: FakeCompanion(),
-          platform: TargetPlatform.android,
-        ),
-      );
-      await tester.pump();
-      var slider = tester.widget<Slider>(
-        find.byKey(const Key('media-volume-slider')),
-      );
-      slider.onChanged!(11);
-      await tester.pump();
-      expect(
-        tester
-            .widget<Slider>(find.byKey(const Key('media-volume-slider')))
-            .value,
-        11,
-      );
-      slider = tester.widget(find.byKey(const Key('media-volume-slider')));
-      slider.onChangeEnd!(11);
-      await tester.pump();
-      expect(bridge.setVolumes, [11]);
-
-      bridge.mediaVolume = const MediaVolume(current: 7, max: 15, fixed: true);
-      await tester.ensureVisible(find.byKey(const Key('refresh-volume')));
-      await tester.tap(find.byKey(const Key('refresh-volume')));
-      await tester.pump();
-      expect(
-        tester
-            .widget<Slider>(find.byKey(const Key('media-volume-slider')))
-            .onChanged,
-        isNull,
-      );
-    },
-  );
-
-  testWidgets(
-    'volume read failure ends loading and tone resets automatically',
+    'unused phone volume cannot surface errors and tone resets automatically',
     (tester) async {
       final bridge = FakeBridge()..volumeReadError = Exception('read failed');
       await tester.pumpWidget(
@@ -403,7 +360,7 @@ void main() {
       );
       await tester.pump();
       expect(find.byType(LinearProgressIndicator), findsNothing);
-      expect(find.textContaining('read failed'), findsOneWidget);
+      expect(find.textContaining('read failed'), findsNothing);
 
       bridge.volumeReadError = null;
       await tester.tap(find.byKey(const Key('nav-settings')));

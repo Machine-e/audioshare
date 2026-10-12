@@ -21,10 +21,8 @@ class RegressionBridge extends existing.FakeBridge {
   final starts = <String>[];
   Object? preferenceError;
   Object? settingsError;
-  Object? setVolumeError;
   Completer<void>? blockedWrite;
   Completer<void>? blockedPlay;
-  final volumeReads = <Future<MediaVolume>>[];
 
   @override
   Future<String?> readPreferredDevice() async {
@@ -58,19 +56,6 @@ class RegressionBridge extends existing.FakeBridge {
   Future<void> openBluetoothSettings() async {
     if (settingsError != null) throw settingsError!;
     await super.openBluetoothSettings();
-  }
-
-  @override
-  Future<MediaVolume> getMediaVolume() {
-    if (volumeReads.isNotEmpty) return volumeReads.removeAt(0);
-    return super.getMediaVolume();
-  }
-
-  @override
-  Future<MediaVolume> setMediaVolume(int value) async {
-    setVolumes.add(value);
-    if (setVolumeError != null) throw setVolumeError!;
-    return MediaVolume(current: value, max: mediaVolume.max, fixed: false);
   }
 
   @override
@@ -216,61 +201,6 @@ void main() {
       controller.dispose();
     },
   );
-
-  testWidgets('failed reread removes stale Android volume controls', (
-    tester,
-  ) async {
-    final bridge = RegressionBridge()
-      ..volumeReads.add(
-        Future.value(const MediaVolume(current: 4, max: 10, fixed: false)),
-      );
-    await tester.pumpWidget(
-      AudioShareApp(
-        bridge: bridge,
-        companionBridge: RegressionCompanion(),
-        platform: TargetPlatform.android,
-      ),
-    );
-    await tester.pump();
-    expect(find.byKey(const Key('media-volume-slider')), findsOneWidget);
-    bridge.volumeReads.add(Future.error(Exception('second read')));
-    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
-    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-    await tester.pump();
-    expect(find.byKey(const Key('media-volume-slider')), findsNothing);
-    expect(find.textContaining('second read'), findsOneWidget);
-  });
-
-  testWidgets('failed set restores draft and max zero disables slider', (
-    tester,
-  ) async {
-    final bridge = RegressionBridge()..setVolumeError = Exception('set failed');
-    await tester.pumpWidget(
-      AudioShareApp(
-        bridge: bridge,
-        companionBridge: RegressionCompanion(),
-        platform: TargetPlatform.android,
-      ),
-    );
-    await tester.pump();
-    var slider = tester.widget<Slider>(
-      find.byKey(const Key('media-volume-slider')),
-    );
-    slider.onChanged!(11);
-    slider.onChangeEnd!(11);
-    await tester.pump();
-    slider = tester.widget(find.byKey(const Key('media-volume-slider')));
-    expect(slider.value, 7);
-    expect(find.textContaining('set failed'), findsOneWidget);
-
-    bridge.setVolumeError = null;
-    bridge.mediaVolume = const MediaVolume(current: 0, max: 0, fixed: false);
-    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-    await tester.pump();
-    slider = tester.widget(find.byKey(const Key('media-volume-slider')));
-    expect(slider.onChanged, isNull);
-    expect(slider.onChangeEnd, isNull);
-  });
 
   testWidgets(
     'background stops tone and confirmation enables only after play',

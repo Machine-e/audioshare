@@ -545,7 +545,7 @@ void main() {
   });
 
   testWidgets(
-    'two devices fit narrow large-text layout and volume is reachable',
+    'two devices fit narrow large-text layout without the volume card',
     (tester) async {
       tester.view.physicalSize = const Size(320, 700);
       tester.view.devicePixelRatio = 1;
@@ -562,32 +562,9 @@ void main() {
       );
       await pumpAndroid(tester, companion);
       expect(tester.takeException(), isNull);
-      await tester.ensureVisible(find.text('传输音量'));
-      await tester.pumpAndSettle();
-      expect(find.byKey(const Key('media-volume-slider')), findsOneWidget);
+      expect(find.text('传输音量'), findsNothing);
+      expect(find.byKey(const Key('media-volume-slider')), findsNothing);
       expect(tester.takeException(), isNull);
     },
   );
-
-  testWidgets('physical slider drag updates percent and commits only on end', (
-    tester,
-  ) async {
-    final route = FakeBridge();
-    final companion = FakeCompanionBridge(
-      const CompanionSnapshot(permission: true, bluetoothEnabled: true),
-    );
-    await pumpAndroid(tester, companion, route: route);
-    final slider = find.byKey(const Key('media-volume-slider'));
-    await tester.ensureVisible(slider);
-    await tester.pumpAndSettle();
-    expect(find.text('47%'), findsOneWidget);
-    final gesture = await tester.startGesture(tester.getCenter(slider));
-    await gesture.moveBy(const Offset(80, 0));
-    await tester.pump();
-    expect(route.setVolumes, isEmpty);
-    expect(find.text('47%'), findsNothing);
-    await gesture.up();
-    await tester.pump();
-    expect(route.setVolumes, hasLength(1));
-  });
 }

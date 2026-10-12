@@ -6,17 +6,20 @@ namespace audioshare {
 
 enum class SinkOpenOutcome { opened, transient_failure, denied, cancelled };
 
-// Repeating OpenAsync on a failed driver session does not reproduce a manual
-// disconnect/reconnect. After bounded open retries fail, rebuild once, provided
-// the user's request is still current. Never reset an opened or denied route.
+// Repeating OpenAsync on the same driver session does not reproduce a manual
+// stop/start. Some A2DP drivers also report success and expose volume controls
+// for a silent first session. With prime_opened enabled, treat that first open
+// as a warm-up and rebuild before publishing startup success. Failure recovery
+// and warm-up share ONE rebuild budget; never loop on silence or reset on deny.
 template <typename Attempt, typename Reset, typename Current>
 SinkOpenOutcome RecoverSinkSessionOnce(Attempt attempt, Reset reset,
-                                      Current current) {
+                                      Current current, bool prime_opened = false) {
   if (!current()) return SinkOpenOutcome::cancelled;
   auto outcome = attempt();
   if (!current()) return SinkOpenOutcome::cancelled;
-  if (outcome != SinkOpenOutcome::transient_failure) return outcome;
-  reset();
+  if (outcome != SinkOpenOutcome::transient_failure &&
+      !(prime_opened && outcome == SinkOpenOutcome::opened)) return outcome;
+  reset(outcome);
   if (!current()) return SinkOpenOutcome::cancelled;
   outcome = attempt();
   return current() ? outcome : SinkOpenOutcome::cancelled;

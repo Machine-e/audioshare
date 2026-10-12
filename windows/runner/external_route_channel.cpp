@@ -663,8 +663,8 @@ std::function<void()> RegisterExternalRouteChannel(flutter::BinaryMessenger* mes
                 // Denial must win over a stale or provisional Opened state.
                 if (opened.Status() == AudioPlaybackConnectionOpenResultStatus::DeniedBySystem)
                   return SinkOpenOutcome::denied;
-                if (opened.Status() == AudioPlaybackConnectionOpenResultStatus::Success ||
-                    connection.State() == AudioPlaybackConnectionState::Opened)
+                // A provisional Opened event cannot override a failed result.
+                if (opened.Status() == AudioPlaybackConnectionOpenResultStatus::Success)
                   return SinkOpenOutcome::opened;
                 open_diagnostic = "OpenAsync status=" +
                     std::to_string(static_cast<int>(opened.Status())) +
@@ -687,23 +687,34 @@ std::function<void()> RegisterExternalRouteChannel(flutter::BinaryMessenger* mes
             }, [&] { return Current(state, generation); }, [](auto delay) {
               std::this_thread::sleep_for(delay);
             });
-          }, [&] {
-            audioshare::TraceConnection(generation, "rebuild_failed_connection");
-            // Detach the failed native session before disposing it. This is the
-            // same lifetime boundary as Stop, without ending the user's request.
+          }, [&](SinkOpenOutcome previous) {
+            const bool priming = previous == SinkOpenOutcome::opened;
+            audioshare::TraceConnection(generation, priming
+                ? "prime_first_connection" : "rebuild_failed_connection");
+            if (priming) {
+              // Let the driver finish creating its first render graph before
+              // the stop/start boundary. No meter/volume level is used as a
+              // playback test: a valid silent/paused stream is not an error.
+              for (int tick = 0; tick < 15; ++tick) {
+                if (!Current(state, generation)) throw winrt::hresult_canceled();
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+              }
+            }
+            // Detach before Close so old events cannot terminate the new
+            // connection. Startup remains pending throughout the warm-up.
             BluetoothResources failed;
             if (!TakeConnection(state, generation, connection,
-                                "Retrying Bluetooth receiver startup.", failed))
+                                "Preparing Bluetooth receiver startup.", failed))
               throw winrt::hresult_canceled();
             CloseResources(std::move(failed));
             connection = nullptr;
             subscribed = false;
             ownership_transferred = false;
-            for (int tick = 0; tick < 10; ++tick) {
+            for (int tick = 0; tick < 15; ++tick) {
               if (!Current(state, generation)) throw winrt::hresult_canceled();
               std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-          }, [&] { return Current(state, generation); });
+          }, [&] { return Current(state, generation); }, true);
           if (outcome == SinkOpenOutcome::cancelled) throw winrt::hresult_canceled();
           if (outcome == SinkOpenOutcome::denied) throw winrt::hresult_access_denied();
           if (outcome != SinkOpenOutcome::opened)

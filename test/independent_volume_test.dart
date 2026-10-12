@@ -18,7 +18,7 @@ void main() {
     expect(volume.available, isFalse);
   });
 
-  testWidgets('A2DP does not offer a slider that changes system volume', (
+  testWidgets('Android omits the volume card and never queries phone volume', (
     tester,
   ) async {
     const channel = MethodChannel('com.machinee.audioshare/external_route');
@@ -52,12 +52,14 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('media-volume-slider')), findsNothing);
-    expect(find.text('当前蓝牙模式暂不支持独立音量与增益。'), findsOneWidget);
+    expect(find.text('当前蓝牙模式暂不支持独立音量与增益。'), findsNothing);
+    expect(find.text('传输音量'), findsNothing);
+    expect(find.byKey(const Key('refresh-volume')), findsNothing);
     expect(find.text('0%'), findsNothing);
-    await tester.ensureVisible(find.byKey(const Key('refresh-volume')));
-    await tester.tap(find.byKey(const Key('refresh-volume')));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.pumpAndSettle();
-    expect(calls.where((call) => call == 'getMediaVolume').length, 2);
+    expect(calls, isNot(contains('getMediaVolume')));
     expect(calls, isNot(contains('setMediaVolume')));
   });
 }
