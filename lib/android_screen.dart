@@ -839,12 +839,6 @@ class _AndroidScreenState extends State<AndroidScreen>
           ],
         ),
       ),
-      const SizedBox(height: 16),
-      Text(
-        '界面字体：MiSans · 小米',
-        textAlign: TextAlign.center,
-        style: Theme.of(context).textTheme.bodySmall,
-      ),
     ];
     return Column(
       children: [

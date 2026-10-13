@@ -9,5 +9,5 @@ Downloaded: 2026-10-13. Copyright belongs to the respective font owners.
 
 The original MiSans Fonts Intellectual Property License Agreement is included
 as `LICENSE.pdf`. MiSans is bundled only as part of AudioShare, without
-subsetting, renaming, adaptation, or separate font distribution. The app's
-settings/help credit MiSans. These files are not covered by the app's license.
+subsetting, renaming, adaptation, or separate font distribution. These files
+are not covered by the app's license.
